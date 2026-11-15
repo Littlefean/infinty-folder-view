@@ -1,10 +1,12 @@
+mod animation_check;
 mod camera;
 mod documents;
 mod markdown;
 mod renderer;
 mod scene;
 
-use camera::Camera;
+use animation_check::AnimationCheck;
+use camera::{Camera, CameraMotion};
 use objc2::rc::autoreleasepool;
 use renderer::Renderer;
 use scene::{Scene, TOP_BAR};
@@ -22,6 +24,7 @@ struct Options {
     demo: bool,
     count: usize,
     smoke: Option<PathBuf>,
+    animation_check: Option<PathBuf>,
 }
 
 impl Options {
@@ -33,6 +36,7 @@ impl Options {
             demo: true,
             count: 72,
             smoke: None,
+            animation_check: None,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -55,14 +59,24 @@ impl Options {
                             .into(),
                     )
                 }
+                "--animation-test" => {
+                    options.animation_check = Some(
+                        args.next()
+                            .ok_or("--animation-test needs an output directory")?
+                            .into(),
+                    )
+                }
                 "--help" | "-h" => {
                     println!(
-                        "Markdown Atlas — native Rust + Skia/SkParagraph + Metal\n\n  cargo run --release\n  cargo run --release -- --dir /path/to/markdown\n  cargo run --release -- --demo-count 200\n  cargo run --release -- --smoke-test work/smoke\n\nControls: middle drag / Space+left drag to pan; wheel to zoom at cursor; F fit all; 1 actual size; R reset; L toggle overview detail. Click minimap to navigate. Drop a Markdown file or folder to load it.\n\nDefault: generate 72 real Markdown files in demo-markdown/ without overwriting existing files. macOS / Metal required."
+                        "Markdown Atlas — native Rust + Skia/SkParagraph + Metal\n\n  cargo run --release\n  cargo run --release -- --dir /path/to/markdown\n  cargo run --release -- --demo-count 200\n  cargo run --release -- --smoke-test work/smoke\n  cargo run --release -- --animation-test work/animation\n\nControls: middle drag / Space+left drag to pan; wheel to smoothly zoom at cursor; F fit all; 1 actual size; R reset; L toggle overview detail. Click minimap to navigate. Drop a Markdown file or folder to load it.\n\nDefault: generate 72 real Markdown files in demo-markdown/ without overwriting existing files. macOS / Metal required."
                     );
                     return Ok(None);
                 }
                 _ => return Err(format!("Unknown argument {arg}; use --help").into()),
             }
+        }
+        if options.smoke.is_some() && options.animation_check.is_some() {
+            return Err("Choose either --smoke-test or --animation-test".into());
         }
         Ok(Some(options))
     }
@@ -87,9 +101,21 @@ struct App {
     error: Option<String>,
     occluded: bool,
     retry_draw: bool,
+    motion: CameraMotion,
+    animation_time: Option<Instant>,
+    animation_check: Option<AnimationCheck>,
 }
 
 impl App {
+    fn wait_for_event(&self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(
+            self.animation_check
+                .as_ref()
+                .and_then(AnimationCheck::deadline)
+                .map_or(ControlFlow::Wait, ControlFlow::WaitUntil),
+        );
+    }
+
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: impl std::fmt::Display) {
         let message = error.to_string();
         eprintln!("{message}");
@@ -102,6 +128,7 @@ impl App {
             return;
         };
         if self.occluded {
+            self.animation_time = None;
             return;
         }
         // Layout happens once per file. Limiting it to one file per redraw keeps startup interactive.
@@ -110,6 +137,18 @@ impl App {
         }
         let ready = self.scene.ready();
         let (width, height) = renderer.logical_size();
+        if ready
+            && let Some(check) = &mut self.animation_check
+            && !check.started()
+        {
+            let anchor = (width * 0.6, height * 0.45);
+            check.begin(self.scene.camera, anchor);
+            // Exactly one input impulse. Subsequent frames must come from the animation loop.
+            self.motion
+                .zoom_at(&self.scene.camera, anchor.0, anchor.1, 0.55);
+            self.animation_time = Some(Instant::now());
+            event_loop.set_control_flow(ControlFlow::WaitUntil(check.deadline().unwrap()));
+        }
         let mut snapshot = None;
         if ready && let Some(smoke) = &mut self.smoke {
             match smoke.frame {
@@ -148,6 +187,18 @@ impl App {
         let started = Instant::now();
         let result = autoreleasepool(|_| {
             renderer.draw(snapshot.as_deref(), |canvas, width, height| {
+                // Sample time after nextDrawable's possible vsync wait, immediately before paint.
+                let now = Instant::now();
+                if self.motion.is_active() {
+                    let dt = self
+                        .animation_time
+                        .replace(now)
+                        .map_or(0.0, |previous| now.duration_since(previous).as_secs_f64());
+                    self.motion.advance(&mut self.scene.camera, dt);
+                }
+                if !self.motion.is_active() {
+                    self.animation_time = None;
+                }
                 self.scene.paint(canvas, width, height)
             })
         });
@@ -159,6 +210,7 @@ impl App {
                 return;
             }
             Ok(false) => {
+                self.animation_time = None;
                 if !renderer.window.is_minimized().unwrap_or(false) {
                     self.retry_draw = true;
                     event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -167,7 +219,12 @@ impl App {
                 }
                 return;
             }
-            Ok(true) => {}
+            Ok(true) => {
+                self.retry_draw = false;
+            }
+        }
+        if ready && let Some(check) = &mut self.animation_check {
+            check.record(self.scene.camera, elapsed, self.motion.is_active());
         }
         if ready && let Some(smoke) = &mut self.smoke {
             let now = Instant::now();
@@ -210,17 +267,36 @@ impl App {
                 return;
             }
         }
-        if !ready || self.smoke.is_some() {
+        // A wheel event starts an animation, rather than drawing just one zoom step.
+        // Metal's synchronized drawable presentation provides frame pacing.
+        if !ready || self.smoke.is_some() || self.motion.is_active() {
             renderer.window.request_redraw();
         }
+        self.wait_for_event(event_loop);
     }
 }
 
 impl ApplicationHandler for App {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        if self
+            .animation_check
+            .as_ref()
+            .and_then(AnimationCheck::deadline)
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            let check = self.animation_check.take().unwrap();
+            match check.finish() {
+                Ok(report) => {
+                    println!("{report}");
+                    event_loop.exit();
+                }
+                Err(error) => self.fail(event_loop, error),
+            }
+            return;
+        }
         if self.retry_draw && matches!(cause, StartCause::ResumeTimeReached { .. }) {
             self.retry_draw = false;
-            event_loop.set_control_flow(ControlFlow::Wait);
+            self.wait_for_event(event_loop);
             if let Some(renderer) = &self.renderer {
                 renderer.window.request_redraw();
             }
@@ -251,7 +327,11 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => renderer.resize(),
-            WindowEvent::Occluded(occluded) => self.occluded = occluded,
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                // Resume smoothly instead of treating time spent hidden as an animation frame.
+                self.animation_time = None;
+            }
             WindowEvent::Focused(false) => {
                 self.middle_down = false;
                 self.left_down = false;
@@ -264,6 +344,8 @@ impl ApplicationHandler for App {
                     self.scene
                         .camera
                         .pan(p.x - self.cursor.0, p.y - self.cursor.1);
+                    self.motion.cancel(self.scene.camera);
+                    self.animation_time = None;
                 }
                 self.cursor = (p.x, p.y);
                 if !self.middle_down && !(self.space_down && self.left_down) {
@@ -273,16 +355,30 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 match button {
-                    MouseButton::Middle => self.middle_down = pressed,
+                    MouseButton::Middle => {
+                        self.middle_down = pressed;
+                        if pressed {
+                            self.motion.cancel(self.scene.camera);
+                        }
+                    }
                     MouseButton::Left => {
                         self.left_down = pressed;
+                        if pressed && self.space_down {
+                            self.motion.cancel(self.scene.camera);
+                        }
                         if pressed && !self.space_down {
+                            let before = self.scene.camera;
                             self.scene.navigate_minimap(
                                 self.cursor.0,
                                 self.cursor.1,
                                 width,
                                 height,
                             );
+                            let destination = self.scene.camera;
+                            self.scene.camera = before;
+                            if destination != before {
+                                self.motion.move_to(destination);
+                            }
                         }
                     }
                     _ => {}
@@ -293,7 +389,11 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y as f64 * 0.12,
                     MouseScrollDelta::PixelDelta(p) => p.y / renderer.window.scale_factor() * 0.003,
                 };
-                self.scene.camera.zoom_at(
+                if !amount.is_finite() || amount == 0.0 {
+                    return;
+                }
+                self.motion.zoom_at(
+                    &self.scene.camera,
                     self.cursor.0,
                     self.cursor.1,
                     amount.clamp(-0.7, 0.7).exp(),
@@ -306,17 +406,18 @@ impl ApplicationHandler for App {
                 }
                 if pressed && !event.repeat {
                     match &event.logical_key {
-                        Key::Character(key) if key.eq_ignore_ascii_case("f") => self
-                            .scene
-                            .camera
-                            .fit(self.scene.bounds, width, height - 38.0, TOP_BAR),
-                        Key::Character(key) if key == "1" => self.scene.camera.zoom_at(
-                            width / 2.0,
-                            height / 2.0,
-                            1.0 / self.scene.camera.scale,
-                        ),
+                        Key::Character(key) if key.eq_ignore_ascii_case("f") => {
+                            let mut destination = self.scene.camera;
+                            destination.fit(self.scene.bounds, width, height - 38.0, TOP_BAR);
+                            self.motion.move_to(destination);
+                        }
+                        Key::Character(key) if key == "1" => {
+                            let mut destination = self.scene.camera;
+                            destination.zoom_at(width / 2.0, height / 2.0, 1.0 / destination.scale);
+                            self.motion.move_to(destination);
+                        }
                         Key::Character(key) if key.eq_ignore_ascii_case("r") => {
-                            self.scene.camera = Camera::default();
+                            self.motion.move_to(Camera::default());
                             self.scene.message.clear();
                         }
                         Key::Character(key) if key.eq_ignore_ascii_case("l") => {
@@ -331,18 +432,31 @@ impl ApplicationHandler for App {
                             self.middle_down = false;
                             self.left_down = false;
                             self.space_down = false;
+                            self.motion.cancel(self.scene.camera);
                             self.scene.message.clear();
                         }
-                        Key::Named(NamedKey::ArrowLeft) => self.scene.camera.pan(160.0, 0.0),
-                        Key::Named(NamedKey::ArrowRight) => self.scene.camera.pan(-160.0, 0.0),
-                        Key::Named(NamedKey::ArrowUp) => self.scene.camera.pan(0.0, 160.0),
-                        Key::Named(NamedKey::ArrowDown) => self.scene.camera.pan(0.0, -160.0),
+                        Key::Named(NamedKey::ArrowLeft) => {
+                            self.motion.pan_by(&self.scene.camera, 160.0, 0.0)
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            self.motion.pan_by(&self.scene.camera, -160.0, 0.0)
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            self.motion.pan_by(&self.scene.camera, 0.0, 160.0)
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            self.motion.pan_by(&self.scene.camera, 0.0, -160.0)
+                        }
                         _ => {}
                     }
                 }
             }
             WindowEvent::DroppedFile(path) => match documents::load_documents(&path) {
-                Ok(documents) if !documents.is_empty() => self.scene = Scene::new(documents),
+                Ok(documents) if !documents.is_empty() => {
+                    self.scene = Scene::new(documents);
+                    self.motion.cancel(self.scene.camera);
+                    self.animation_time = None;
+                }
                 Ok(_) => self.scene.message = "没有找到 Markdown 文件。按 R 返回。".into(),
                 Err(error) => {
                     eprintln!("{error}");
@@ -350,6 +464,11 @@ impl ApplicationHandler for App {
                 }
             },
             _ => return,
+        }
+        if self.motion.is_active() {
+            self.animation_time.get_or_insert_with(Instant::now);
+        } else {
+            self.animation_time = None;
         }
         renderer
             .window
@@ -399,6 +518,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         error: None,
         occluded: false,
         retry_draw: false,
+        motion: CameraMotion::new(Camera::default()),
+        animation_time: None,
+        animation_check: options.animation_check.map(AnimationCheck::new),
     };
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);

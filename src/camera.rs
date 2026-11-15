@@ -152,6 +152,131 @@ impl Camera {
     }
 }
 
+// Project Graph's 0.11 per-tick interpolation at 120 Hz, converted to exponential
+// decay per second: -ln(1 - 0.11) * 120. This keeps the response independent of FPS.
+const SMOOTHING_RATE: f64 = 13.984;
+const POSITION_EPSILON: f64 = 0.05;
+const RELATIVE_SCALE_EPSILON: f64 = 0.00001;
+
+#[derive(Clone, Copy, Debug)]
+pub struct CameraMotion {
+    target: Camera,
+    active: bool,
+}
+
+impl CameraMotion {
+    pub fn new(camera: Camera) -> Self {
+        Self {
+            target: if Self::valid_camera(&camera) {
+                camera
+            } else {
+                Camera::default()
+            },
+            active: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn target(&self) -> Camera {
+        self.target
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn zoom_at(&mut self, current: &Camera, x: f64, y: f64, factor: f64) {
+        if !Self::valid_camera(current)
+            || !x.is_finite()
+            || !y.is_finite()
+            || !factor.is_finite()
+            || factor <= 0.0
+        {
+            return;
+        }
+        let (world_x, world_y) = current.screen_to_world(x, y);
+        let scale = (self.target.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
+        let target = Camera {
+            x: x - world_x * scale,
+            y: y - world_y * scale,
+            scale,
+        };
+        if Self::valid_camera(&target) {
+            self.target = target;
+            self.active = current != &target;
+        }
+    }
+
+    pub fn move_to(&mut self, mut target: Camera) {
+        if Self::valid_camera(&target) {
+            target.scale = target.scale.clamp(MIN_SCALE, MAX_SCALE);
+            self.target = target;
+            self.active = true;
+        }
+    }
+
+    pub fn pan_by(&mut self, current: &Camera, dx: f64, dy: f64) {
+        if !Self::valid_camera(current) || !dx.is_finite() || !dy.is_finite() {
+            return;
+        }
+        let base = if self.active { self.target } else { *current };
+        let target = Camera {
+            x: base.x + dx,
+            y: base.y + dy,
+            scale: base.scale,
+        };
+        if Self::valid_camera(&target) {
+            self.target = target;
+            self.active = current != &target;
+        }
+    }
+
+    pub fn cancel(&mut self, current: Camera) {
+        if Self::valid_camera(&current) {
+            self.target = current;
+            self.active = false;
+        }
+    }
+
+    pub fn advance(&mut self, current: &mut Camera, dt_seconds: f64) -> bool {
+        if !self.active
+            || !Self::valid_camera(current)
+            || !dt_seconds.is_finite()
+            || dt_seconds <= 0.0
+        {
+            return self.active;
+        }
+        let alpha = -(-SMOOTHING_RATE * dt_seconds).exp_m1();
+        // Using the same alpha for scale and offsets preserves the cursor's world
+        // point throughout an anchored zoom, not only at its destination.
+        let blend = |value: f64, target: f64| value * (1.0 - alpha) + target * alpha;
+        let next = Camera {
+            x: blend(current.x, self.target.x),
+            y: blend(current.y, self.target.y),
+            scale: blend(current.scale, self.target.scale),
+        };
+        if !Self::valid_camera(&next) {
+            return self.active;
+        }
+        *current = next;
+        let position_error = (current.x - self.target.x).hypot(current.y - self.target.y);
+        let scale_error =
+            (current.scale - self.target.scale).abs() / current.scale.max(self.target.scale);
+        if position_error < POSITION_EPSILON && scale_error < RELATIVE_SCALE_EPSILON {
+            *current = self.target;
+            self.active = false;
+        }
+        self.active
+    }
+
+    fn valid_camera(camera: &Camera) -> bool {
+        camera.x.is_finite()
+            && camera.y.is_finite()
+            && camera.scale.is_finite()
+            && camera.scale > 0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +364,160 @@ mod tests {
         camera.zoom_at(f64::NAN, 0.0, 2.0);
         camera.fit(Rect::new(0.0, 0.0, 100.0, 100.0), 0.0, 0.0, 90.0);
         assert_eq!(camera, before);
+    }
+
+    #[test]
+    fn smoothing_matches_at_sixty_and_one_twenty_hz() {
+        let mut at_sixty = Camera::default();
+        let mut at_one_twenty = at_sixty;
+        let mut sixty_motion = CameraMotion::new(at_sixty);
+        let mut one_twenty_motion = CameraMotion::new(at_one_twenty);
+        sixty_motion.zoom_at(&at_sixty, 730.0, 415.0, 2.0);
+        one_twenty_motion.zoom_at(&at_one_twenty, 730.0, 415.0, 2.0);
+        for _ in 0..6 {
+            assert!(sixty_motion.advance(&mut at_sixty, 1.0 / 60.0));
+        }
+        for _ in 0..12 {
+            assert!(one_twenty_motion.advance(&mut at_one_twenty, 1.0 / 120.0));
+        }
+        near(at_sixty.x, at_one_twenty.x);
+        near(at_sixty.y, at_one_twenty.y);
+        near(at_sixty.scale, at_one_twenty.scale);
+    }
+
+    #[test]
+    fn animated_zoom_keeps_cursor_anchor_on_every_frame() {
+        let mut camera = Camera::default();
+        let mut motion = CameraMotion::new(camera);
+        let anchor = camera.screen_to_world(836.0, 392.0);
+        for factor in [2.4, 0.001, 1.0e20] {
+            motion.zoom_at(&camera, 836.0, 392.0, factor);
+            for _ in 0..200 {
+                let active = motion.advance(&mut camera, 1.0 / 120.0);
+                let screen = camera.world_to_screen(anchor.0, anchor.1);
+                near(screen.0, 836.0);
+                near(screen.1, 392.0);
+                if !active {
+                    break;
+                }
+            }
+            assert!(!motion.is_active());
+            assert_eq!(camera, motion.target());
+        }
+    }
+
+    #[test]
+    fn wheel_events_accumulate_and_reverse_target_without_jumping_current() {
+        let mut camera = Camera::default();
+        let initial = camera;
+        let mut motion = CameraMotion::new(camera);
+        motion.zoom_at(&camera, 400.0, 300.0, 1.2);
+        motion.zoom_at(&camera, 400.0, 300.0, 1.2);
+        near(motion.target().scale, initial.scale * 1.2 * 1.2);
+        assert_eq!(camera, initial);
+        motion.advance(&mut camera, 1.0 / 120.0);
+        let before_reverse = camera;
+        motion.zoom_at(&camera, 400.0, 300.0, 1.0 / 1.2);
+        motion.zoom_at(&camera, 400.0, 300.0, 1.0 / 1.2);
+        near(motion.target().scale, initial.scale);
+        near(motion.target().x, initial.x);
+        near(motion.target().y, initial.y);
+        assert_eq!(camera, before_reverse);
+    }
+
+    #[test]
+    fn changing_zoom_cursor_reanchors_without_a_position_jump() {
+        let mut camera = Camera::default();
+        let mut motion = CameraMotion::new(camera);
+        motion.zoom_at(&camera, 300.0, 220.0, 1.4);
+        motion.advance(&mut camera, 1.0 / 60.0);
+        let before_reanchor = camera;
+        let anchor = camera.screen_to_world(1050.0, 620.0);
+        motion.zoom_at(&camera, 1050.0, 620.0, 1.3);
+        assert_eq!(camera, before_reanchor);
+        near(motion.target().scale, Camera::default().scale * 1.4 * 1.3);
+        for _ in 0..20 {
+            motion.advance(&mut camera, 1.0 / 120.0);
+            let screen = camera.world_to_screen(anchor.0, anchor.1);
+            near(screen.0, 1050.0);
+            near(screen.1, 620.0);
+        }
+    }
+
+    #[test]
+    fn pending_pan_accumulates_and_cancel_stops_exactly() {
+        let mut camera = Camera::default();
+        let mut motion = CameraMotion::new(camera);
+        motion.pan_by(&camera, 160.0, -40.0);
+        motion.advance(&mut camera, 1.0 / 120.0);
+        motion.pan_by(&camera, 160.0, -40.0);
+        near(motion.target().x, Camera::default().x + 320.0);
+        near(motion.target().y, Camera::default().y - 80.0);
+        motion.cancel(camera);
+        let stopped = camera;
+        assert!(!motion.is_active());
+        assert!(!motion.advance(&mut camera, 1.0));
+        assert_eq!(camera, stopped);
+        assert_eq!(motion.target(), stopped);
+    }
+
+    #[test]
+    fn move_to_converges_and_snaps_to_exact_target() {
+        let mut camera = Camera::default();
+        let mut motion = CameraMotion::new(camera);
+        let target = Camera {
+            x: -9120.0,
+            y: 1800.0,
+            scale: 0.025,
+        };
+        motion.move_to(target);
+        for _ in 0..240 {
+            if !motion.advance(&mut camera, 1.0 / 120.0) {
+                break;
+            }
+        }
+        assert_eq!(camera, target);
+        assert!(!motion.is_active());
+        motion.move_to(Camera {
+            scale: 100.0,
+            ..target
+        });
+        assert_eq!(motion.target().scale, MAX_SCALE);
+    }
+
+    #[test]
+    fn motion_rejects_invalid_events_and_elapsed_time() {
+        let mut camera = Camera::default();
+        let mut motion = CameraMotion::new(camera);
+        motion.zoom_at(&camera, 400.0, 300.0, 1.4);
+        let target = motion.target();
+        motion.zoom_at(&camera, 400.0, 300.0, f64::NAN);
+        motion.zoom_at(&camera, 400.0, 300.0, -1.0);
+        motion.zoom_at(&camera, f64::INFINITY, 300.0, 1.2);
+        motion.pan_by(&camera, f64::INFINITY, 0.0);
+        motion.move_to(Camera {
+            scale: 0.0,
+            ..camera
+        });
+        motion.cancel(Camera {
+            x: f64::NAN,
+            ..camera
+        });
+        assert_eq!(motion.target(), target);
+        let before = camera;
+        for dt in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(motion.advance(&mut camera, dt));
+            assert_eq!(camera, before);
+        }
+        assert_eq!(motion.target(), target);
+        assert!(motion.is_active());
+        assert_eq!(
+            CameraMotion::new(Camera {
+                scale: f64::NAN,
+                ..camera
+            })
+            .target(),
+            Camera::default()
+        );
     }
 }
