@@ -1,8 +1,14 @@
+use std::{
+    cell::{Ref, RefCell},
+    ops::Range,
+};
+
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use skia_safe::{
     Canvas, Color, FontMgr, FontStyle, Paint, Rect,
     textlayout::{
-        FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, TextDecoration, TextStyle,
+        Affinity, FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, RectHeightStyle,
+        RectWidthStyle, TextDecoration, TextStyle,
     },
 };
 use syntect::{
@@ -11,6 +17,7 @@ use syntect::{
     parsing::SyntaxSet,
     util::LinesWithEndings,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 const TEXT: Color = Color::from_rgb(204, 212, 222);
 const HEADING: Color = Color::from_rgb(240, 244, 249);
@@ -375,21 +382,185 @@ fn styled_paragraph(
     result
 }
 
+#[derive(Debug)]
+struct TextBoundary {
+    byte: usize,
+    utf16: usize,
+}
+
+#[derive(Debug)]
+struct TextMapping {
+    range: Range<usize>,
+    boundaries: Vec<TextBoundary>,
+    selection_cache: RefCell<Option<SelectionGeometry>>,
+}
+
+#[derive(Debug)]
+struct SelectionGeometry {
+    range: Range<usize>,
+    rects: Vec<Rect>,
+    prefix_bottom: Vec<f32>,
+}
+
+impl SelectionGeometry {
+    fn new(range: Range<usize>, mut rects: Vec<Rect>) -> Self {
+        rects.sort_by(|a, b| a.top.total_cmp(&b.top));
+        let mut bottom = f32::NEG_INFINITY;
+        let prefix_bottom = rects
+            .iter()
+            .map(|rect| {
+                bottom = bottom.max(rect.bottom);
+                bottom
+            })
+            .collect();
+        Self {
+            range,
+            rects,
+            prefix_bottom,
+        }
+    }
+
+    fn visible(&self, top: f32, bottom: f32) -> impl Iterator<Item = &Rect> {
+        let start = self.prefix_bottom.partition_point(|last| *last < top);
+        self.rects[start..]
+            .iter()
+            .take_while(move |rect| rect.top <= bottom)
+            .filter(move |rect| rect.bottom >= top)
+    }
+}
+
+impl TextMapping {
+    fn new(text: &str, start: usize) -> Self {
+        let mut boundaries = Vec::new();
+        let mut utf16 = 0;
+        for (byte, grapheme) in text.grapheme_indices(true) {
+            boundaries.push(TextBoundary { byte, utf16 });
+            utf16 += grapheme.encode_utf16().count();
+        }
+        boundaries.push(TextBoundary {
+            byte: text.len(),
+            utf16,
+        });
+        Self {
+            range: start..start + text.len(),
+            boundaries,
+            selection_cache: RefCell::new(None),
+        }
+    }
+
+    fn byte_to_utf16(&self, byte: usize) -> usize {
+        let index = self
+            .boundaries
+            .partition_point(|boundary| boundary.byte <= byte);
+        self.boundaries[index.saturating_sub(1)].utf16
+    }
+
+    fn utf16_to_byte(&self, utf16: usize, ceil: bool) -> usize {
+        let utf16 = utf16.min(self.boundaries.last().unwrap().utf16);
+        let index = self
+            .boundaries
+            .partition_point(|boundary| boundary.utf16 < utf16);
+        let upper = index.min(self.boundaries.len() - 1);
+        if ceil || self.boundaries[upper].utf16 == utf16 {
+            self.boundaries[upper].byte
+        } else {
+            self.boundaries[upper.saturating_sub(1)].byte
+        }
+    }
+
+    fn nearest_byte(&self, utf16: usize, downstream: bool) -> usize {
+        let index = self
+            .boundaries
+            .partition_point(|boundary| boundary.utf16 < utf16);
+        let upper = &self.boundaries[index.min(self.boundaries.len() - 1)];
+        let lower = &self.boundaries[index.saturating_sub(1)];
+        let before = utf16.saturating_sub(lower.utf16);
+        let after = upper.utf16.saturating_sub(utf16);
+        if before < after || (before == after && !downstream) {
+            lower.byte
+        } else {
+            upper.byte
+        }
+    }
+
+    fn selection_geometry(
+        &self,
+        paragraph: &Paragraph,
+        range: Range<usize>,
+    ) -> Ref<'_, SelectionGeometry> {
+        if self
+            .selection_cache
+            .borrow()
+            .as_ref()
+            .is_none_or(|cached| cached.range != range)
+        {
+            let rects = paragraph
+                .get_rects_for_range(range.clone(), RectHeightStyle::Max, RectWidthStyle::Tight)
+                .into_iter()
+                .map(|text_box| text_box.rect)
+                .collect();
+            *self.selection_cache.borrow_mut() = Some(SelectionGeometry::new(range, rects));
+        }
+        Ref::map(self.selection_cache.borrow(), |cached| {
+            cached.as_ref().unwrap()
+        })
+    }
+}
+
+struct TextCell {
+    paragraph: Paragraph,
+    text: TextMapping,
+}
+
+#[derive(Clone, Copy)]
+struct TextLocation {
+    block: usize,
+    cell: usize,
+}
+
+struct Selectable<'a> {
+    paragraph: &'a Paragraph,
+    text: &'a TextMapping,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl Selectable<'_> {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x <= self.x + self.width && y >= self.y && y <= self.y + self.height
+    }
+
+    fn hit(&self, x: f32, y: f32) -> usize {
+        let position = self
+            .paragraph
+            .get_glyph_position_at_coordinate((x - self.x, y - self.y));
+        self.text.range.start
+            + self.text.nearest_byte(
+                position.position.max(0) as usize,
+                position.affinity == Affinity::Downstream,
+            )
+    }
+}
+
 enum LayoutKind {
     Text {
         paragraph: Paragraph,
+        text: TextMapping,
         x: f32,
         quote: bool,
         marker: Option<Paragraph>,
     },
     Code {
         paragraph: Paragraph,
+        text: Option<TextMapping>,
         number: Option<Paragraph>,
         label: bool,
     },
     Rule,
     Table {
-        cells: Vec<Paragraph>,
+        cells: Vec<TextCell>,
         header: bool,
     },
 }
@@ -405,6 +576,10 @@ pub struct MarkdownDocument {
     pub block_count: usize,
     width: f32,
     blocks: Vec<LayoutBlock>,
+    text: String,
+    text_started: bool,
+    text_boundaries: Vec<usize>,
+    selectable: Vec<TextLocation>,
 }
 
 impl MarkdownDocument {
@@ -420,9 +595,14 @@ impl MarkdownDocument {
             block_count: 0,
             width,
             blocks: Vec::new(),
+            text: String::new(),
+            text_started: false,
+            text_boundaries: Vec::new(),
+            selectable: Vec::new(),
         };
         let mut after_table = false;
         for raw in parse(source) {
+            let continues_table = after_table;
             if after_table && !matches!(&raw, RawBlock::TableRow { .. }) {
                 document.height += 16.0;
             }
@@ -460,10 +640,14 @@ impl MarkdownDocument {
                     if heading > 0 && document.height > 0.0 {
                         document.height += 13.0;
                     }
+                    document.begin_text_section("\n\n");
+                    let content: String = runs.iter().map(|run| run.text.as_str()).collect();
+                    let text = document.append_text(&content);
                     document.push(
                         height,
                         LayoutKind::Text {
                             paragraph,
+                            text,
                             x,
                             quote: quote_depth > 0,
                             marker,
@@ -472,6 +656,7 @@ impl MarkdownDocument {
                     document.height += if list_depth > 0 { 6.0 } else { 13.0 };
                 }
                 RawBlock::Code { source, language } => {
+                    document.begin_text_section("\n\n");
                     document.code(&source, &language, fonts, highlighter)
                 }
                 RawBlock::Rule => {
@@ -484,31 +669,69 @@ impl MarkdownDocument {
                         continue;
                     }
                     let cell_width = width / cells.len() as f32;
-                    let cells: Vec<_> = cells
+                    document.begin_text_section(if continues_table { "\n" } else { "\n\n" });
+                    let mut laid_cells = Vec::new();
+                    for (index, runs) in cells.iter().enumerate() {
+                        if index > 0 {
+                            document.text.push('\t');
+                        }
+                        let content: String = runs.iter().map(|run| run.text.as_str()).collect();
+                        let text = document.append_text(&content);
+                        let paragraph = styled_paragraph(
+                            runs,
+                            14.0,
+                            if header { HEADING } else { TEXT },
+                            cell_width - 24.0,
+                            fonts,
+                            header,
+                        );
+                        laid_cells.push(TextCell { paragraph, text });
+                    }
+                    let height = laid_cells
                         .iter()
-                        .map(|runs| {
-                            styled_paragraph(
-                                runs,
-                                14.0,
-                                if header { HEADING } else { TEXT },
-                                cell_width - 24.0,
-                                fonts,
-                                header,
-                            )
-                        })
-                        .collect();
-                    let height =
-                        cells.iter().map(Paragraph::height).fold(20.0_f32, f32::max) + 20.0;
+                        .map(|cell| cell.paragraph.height())
+                        .fold(20.0_f32, f32::max)
+                        + 20.0;
+                    let cells = laid_cells;
                     document.push(height, LayoutKind::Table { cells, header });
                 }
             }
         }
         document.height = document.height.max(24.0);
         document.block_count = document.blocks.len();
+        document.text_boundaries = document
+            .text
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .collect();
+        document.text_boundaries.push(document.text.len());
         document
     }
 
+    fn begin_text_section(&mut self, separator: &str) {
+        if self.text_started {
+            self.text.push_str(separator);
+        }
+        self.text_started = true;
+    }
+
+    fn append_text(&mut self, text: &str) -> TextMapping {
+        let mapping = TextMapping::new(text, self.text.len());
+        self.text.push_str(text);
+        mapping
+    }
+
     fn push(&mut self, height: f32, kind: LayoutKind) {
+        let block = self.blocks.len();
+        match &kind {
+            LayoutKind::Text { .. } | LayoutKind::Code { text: Some(_), .. } => {
+                self.selectable.push(TextLocation { block, cell: 0 })
+            }
+            LayoutKind::Table { cells, .. } => self
+                .selectable
+                .extend((0..cells.len()).map(|cell| TextLocation { block, cell })),
+            _ => {}
+        }
         self.blocks.push(LayoutBlock {
             y: self.height,
             height,
@@ -551,11 +774,16 @@ impl MarkdownDocument {
             32.0,
             LayoutKind::Code {
                 paragraph: label,
+                text: None,
                 number: None,
                 label: true,
             },
         );
         for (index, line) in LinesWithEndings::from(source).enumerate() {
+            if index > 0 {
+                self.text.push('\n');
+            }
+            let text = self.append_text(line.trim_end_matches(['\r', '\n']));
             let mut style = ParagraphStyle::new();
             style.set_text_style(&text_style(14.0, TEXT, true));
             let mut builder = ParagraphBuilder::new(&style, fonts.clone());
@@ -608,6 +836,7 @@ impl MarkdownDocument {
                 height,
                 LayoutKind::Code {
                     paragraph,
+                    text: Some(text),
                     number,
                     label: false,
                 },
@@ -617,6 +846,7 @@ impl MarkdownDocument {
             12.0,
             LayoutKind::Code {
                 paragraph: paragraph("", 1.0, TEXT, 1.0, fonts),
+                text: None,
                 number: None,
                 label: false,
             },
@@ -624,7 +854,249 @@ impl MarkdownDocument {
         self.height += 16.0;
     }
 
-    pub fn paint(&self, canvas: &Canvas, visible_top: f32, visible_bottom: f32) -> usize {
+    fn selectable_at(&self, location: TextLocation) -> Selectable<'_> {
+        let block = &self.blocks[location.block];
+        match &block.kind {
+            LayoutKind::Text {
+                paragraph, text, x, ..
+            } => Selectable {
+                paragraph,
+                text,
+                x: *x,
+                y: block.y,
+                width: (self.width - x).max(1.0),
+                height: block.height,
+            },
+            LayoutKind::Code {
+                paragraph,
+                text: Some(text),
+                ..
+            } => Selectable {
+                paragraph,
+                text,
+                x: 50.0,
+                y: block.y,
+                width: (self.width - 66.0).max(1.0),
+                height: block.height,
+            },
+            LayoutKind::Table { cells, .. } => {
+                let cell = &cells[location.cell];
+                let width = self.width / cells.len() as f32;
+                Selectable {
+                    paragraph: &cell.paragraph,
+                    text: &cell.text,
+                    x: location.cell as f32 * width + 12.0,
+                    y: block.y + 10.0,
+                    width: (width - 24.0).max(1.0),
+                    height: block.height - 20.0,
+                }
+            }
+            _ => unreachable!("only text-bearing paragraphs enter the selection index"),
+        }
+    }
+
+    pub fn hit_test(&self, x: f32, y: f32, clamp: bool) -> Option<usize> {
+        let text = self.hit_target(x, y, clamp)?;
+        if clamp {
+            let first = self.selectable_at(self.selectable[0]);
+            let last = self.selectable_at(*self.selectable.last().unwrap());
+            if y < first.y {
+                return Some(0);
+            }
+            if y > last.y + last.height {
+                return Some(self.text.len());
+            }
+        }
+        Some(text.hit(x, y))
+    }
+
+    pub fn hit_test_word(&self, x: f32, y: f32, clamp: bool) -> Option<Range<usize>> {
+        let text = self.hit_target(x, y, clamp)?;
+        if clamp {
+            let first = self.selectable_at(self.selectable[0]);
+            let last = self.selectable_at(*self.selectable.last().unwrap());
+            if y < first.y {
+                return Some(self.word_range(0));
+            }
+            if y > last.y + last.height {
+                return Some(self.word_range(self.text.len()));
+            }
+        }
+        let hit = text
+            .paragraph
+            .get_glyph_position_at_coordinate((x - text.x, y - text.y));
+        let mut utf16 = hit.position.max(0) as usize;
+        // A trailing-edge caret belongs to the glyph before it. Keeping this affinity
+        // avoids treating the right half of a word's final glyph as the following space.
+        if hit.affinity == Affinity::Upstream {
+            utf16 = utf16.saturating_sub(1);
+        }
+        let local = text.text.utf16_to_byte(utf16, false);
+        Some(self.word_range(text.text.range.start + local))
+    }
+
+    fn hit_target(&self, x: f32, y: f32, clamp: bool) -> Option<Selectable<'_>> {
+        if self.selectable.is_empty() || !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        let mut index = self
+            .selectable
+            .partition_point(|location| {
+                let text = self.selectable_at(*location);
+                text.y + text.height < y
+            })
+            .min(self.selectable.len() - 1);
+        if clamp && index > 0 {
+            let next = self.selectable_at(self.selectable[index]);
+            let previous = self.selectable_at(self.selectable[index - 1]);
+            if y < next.y && y - (previous.y + previous.height) < next.y - y {
+                index -= 1;
+            }
+        }
+        let block = self.selectable[index].block;
+        let first = self
+            .selectable
+            .partition_point(|location| location.block < block);
+        let end = self
+            .selectable
+            .partition_point(|location| location.block <= block);
+        let mut closest: Option<(f32, TextLocation)> = None;
+        for location in &self.selectable[first..end] {
+            let text = self.selectable_at(*location);
+            if text.contains(x, y) {
+                return Some(text);
+            }
+            if clamp {
+                let dx = (text.x - x).max(0.0).max(x - (text.x + text.width));
+                if closest.as_ref().is_none_or(|(distance, _)| dx < *distance) {
+                    closest = Some((dx, *location));
+                }
+            }
+        }
+        closest.map(|(_, location)| self.selectable_at(location))
+    }
+
+    fn text_at_position(&self, position: usize) -> Option<Selectable<'_>> {
+        if self.selectable.is_empty() {
+            return None;
+        }
+        let position = position.min(self.text.len());
+        let index = self
+            .selectable
+            .partition_point(|location| self.selectable_at(*location).text.range.end < position)
+            .min(self.selectable.len() - 1);
+        Some(self.selectable_at(self.selectable[index]))
+    }
+
+    pub fn word_range(&self, position: usize) -> Range<usize> {
+        let Some(text) = self.text_at_position(position) else {
+            return 0..0;
+        };
+        let local = position
+            .saturating_sub(text.text.range.start)
+            .min(text.text.range.len());
+        let local = if local == text.text.range.len() && local > 0 {
+            text.text.boundaries[text.text.boundaries.len().saturating_sub(2)].byte
+        } else {
+            local
+        };
+        let utf16 = text.text.byte_to_utf16(local);
+        let word = text.paragraph.get_word_boundary(utf16 as u32);
+        let mut range = text.text.range.start + text.text.utf16_to_byte(word.start, false)
+            ..text.text.range.start + text.text.utf16_to_byte(word.end, true);
+        if range.is_empty() && !text.text.range.is_empty() {
+            let index = text
+                .text
+                .boundaries
+                .partition_point(|boundary| boundary.byte <= local)
+                .saturating_sub(1);
+            range = text.text.range.start + text.text.boundaries[index].byte
+                ..text.text.range.start
+                    + text.text.boundaries[(index + 1).min(text.text.boundaries.len() - 1)].byte;
+        }
+        range
+    }
+
+    pub fn paragraph_range(&self, position: usize) -> Range<usize> {
+        self.text_at_position(position)
+            .map(|text| text.text.range.clone())
+            .unwrap_or(0..0)
+    }
+
+    pub fn text_len(&self) -> usize {
+        self.text.len()
+    }
+
+    fn normalized_range(&self, range: Range<usize>) -> Range<usize> {
+        let start = range.start.min(range.end).min(self.text.len());
+        let end = range.start.max(range.end).min(self.text.len());
+        let first = self
+            .text_boundaries
+            .partition_point(|boundary| *boundary <= start)
+            .saturating_sub(1);
+        let start = self.text_boundaries[first];
+        if range.start == range.end {
+            return start..start;
+        }
+        let last = self
+            .text_boundaries
+            .partition_point(|boundary| *boundary < end)
+            .min(self.text_boundaries.len() - 1);
+        start..self.text_boundaries[last]
+    }
+
+    pub fn selected_text(&self, range: Range<usize>) -> String {
+        self.text[self.normalized_range(range)].to_owned()
+    }
+
+    pub fn selection_char_count(&self, range: Range<usize>) -> usize {
+        let range = self.normalized_range(range);
+        let first = self
+            .text_boundaries
+            .partition_point(|boundary| *boundary < range.start);
+        let last = self
+            .text_boundaries
+            .partition_point(|boundary| *boundary < range.end);
+        last - first
+    }
+
+    fn paint_selection(
+        canvas: &Canvas,
+        paragraph: &Paragraph,
+        text: &TextMapping,
+        origin: (f32, f32),
+        selection: &Option<Range<usize>>,
+        visible: Range<f32>,
+    ) {
+        let Some(selection) = selection else {
+            return;
+        };
+        let start = selection.start.max(text.range.start);
+        let end = selection.end.min(text.range.end);
+        if start >= end {
+            return;
+        }
+        let range = text.byte_to_utf16(start - text.range.start)
+            ..text.byte_to_utf16(end - text.range.start);
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_argb(88, 76, 147, 245));
+        let (x, y) = origin;
+        let geometry = text.selection_geometry(paragraph, range);
+        for rect in geometry.visible(visible.start - y, visible.end - y) {
+            canvas.draw_rect(
+                Rect::new(rect.left + x, rect.top + y, rect.right + x, rect.bottom + y),
+                &paint,
+            );
+        }
+    }
+
+    pub fn paint(
+        &self,
+        canvas: &Canvas,
+        visible_top: f32,
+        visible_bottom: f32,
+        selection: Option<Range<usize>>,
+    ) -> usize {
         let top = visible_top.max(0.0);
         let bottom = visible_bottom.min(self.height);
         if bottom <= top {
@@ -638,6 +1110,7 @@ impl MarkdownDocument {
         let mut count = 0;
         let mut paint = Paint::default();
         paint.set_anti_alias(true);
+        let selection = selection.map(|range| self.normalized_range(range));
         for block in &self.blocks[start..] {
             if block.y > visible_bottom {
                 break;
@@ -645,6 +1118,7 @@ impl MarkdownDocument {
             match &block.kind {
                 LayoutKind::Text {
                     paragraph,
+                    text,
                     x,
                     quote,
                     marker,
@@ -663,9 +1137,18 @@ impl MarkdownDocument {
                         );
                     }
                     paragraph.paint(canvas, (*x, block.y));
+                    Self::paint_selection(
+                        canvas,
+                        paragraph,
+                        text,
+                        (*x, block.y),
+                        &selection,
+                        top..bottom,
+                    );
                 }
                 LayoutKind::Code {
                     paragraph,
+                    text,
                     number,
                     label,
                 } => {
@@ -684,6 +1167,16 @@ impl MarkdownDocument {
                             block.y + if *label { 8.0 } else { 0.0 },
                         ),
                     );
+                    if let Some(text) = text {
+                        Self::paint_selection(
+                            canvas,
+                            paragraph,
+                            text,
+                            (50.0, block.y),
+                            &selection,
+                            top..bottom,
+                        );
+                    }
                 }
                 LayoutKind::Rule => {
                     paint.set_color(RULE);
@@ -706,7 +1199,17 @@ impl MarkdownDocument {
                     );
                     let width = self.width / cells.len() as f32;
                     for (index, cell) in cells.iter().enumerate() {
-                        cell.paint(canvas, (index as f32 * width + 12.0, block.y + 10.0));
+                        let x = index as f32 * width + 12.0;
+                        let y = block.y + 10.0;
+                        cell.paragraph.paint(canvas, (x, y));
+                        Self::paint_selection(
+                            canvas,
+                            &cell.paragraph,
+                            &cell.text,
+                            (x, y),
+                            &selection,
+                            top..bottom,
+                        );
                     }
                 }
             }
@@ -803,5 +1306,234 @@ mod tests {
         assert_eq!(marker, "12345.");
         assert!(*first >= 68.0);
         assert_eq!(first, second);
+    }
+
+    fn laid_document(source: &str, width: f32) -> MarkdownDocument {
+        MarkdownDocument::new(source, width, &font_collection(), &Highlighter::new())
+    }
+
+    #[test]
+    fn utf16_offsets_snap_to_whole_graphemes_and_rust_boundaries() {
+        let source = "A中👩‍💻e\u{301}Z";
+        let map = TextMapping::new(source, 7);
+        let boundaries: Vec<_> = map.boundaries.iter().map(|b| (b.byte, b.utf16)).collect();
+        assert_eq!(
+            boundaries,
+            vec![(0, 0), (1, 1), (4, 2), (15, 7), (18, 9), (19, 10)]
+        );
+        assert_eq!(map.utf16_to_byte(3, false), 4);
+        assert_eq!(map.utf16_to_byte(3, true), 15);
+        assert_eq!(map.nearest_byte(6, true), 15);
+        assert_eq!(map.byte_to_utf16(16), 7);
+        for utf16 in 0..=12 {
+            let byte = map.nearest_byte(utf16, true);
+            assert!(source.is_char_boundary(byte));
+            assert!(map.boundaries.iter().any(|boundary| boundary.byte == byte));
+        }
+    }
+
+    #[test]
+    fn copying_normalizes_reverse_ranges_and_preserves_display_text() {
+        let document = laid_document("# 中文 **bold**\n\n第二段 👩‍💻 e\u{301}", 320.0);
+        let expected = "中文 bold\n\n第二段 👩‍💻 e\u{301}";
+        assert_eq!(document.selected_text(0..document.text_len()), expected);
+        assert_eq!(
+            document.selected_text(Range {
+                start: document.text_len(),
+                end: 0
+            }),
+            expected
+        );
+        let accent = expected.find("e\u{301}").unwrap();
+        assert_eq!(document.selected_text(accent + 1..accent + 2), "e\u{301}");
+        let emoji = expected.find('👩').unwrap();
+        assert_eq!(document.selected_text(emoji + 2..emoji + 6), "👩‍💻");
+        assert_eq!(document.selection_char_count(emoji + 2..emoji + 6), 1);
+        assert_eq!(document.selection_char_count(accent + 1..accent + 2), 1);
+        assert_eq!(
+            document.selection_char_count(Range {
+                start: document.text_len(),
+                end: 0
+            }),
+            expected.graphemes(true).count()
+        );
+        assert_eq!(document.selected_text(accent + 1..accent + 1), "");
+        assert_eq!(document.selection_char_count(accent + 1..accent + 1), 0);
+        let second = expected.find("第二段").unwrap();
+        assert_eq!(
+            document.selected_text(document.paragraph_range(second)),
+            "第二段 👩‍💻 e\u{301}"
+        );
+        assert_eq!(
+            document.selected_text(document.word_range(expected.find("bold").unwrap() + 1)),
+            "bold"
+        );
+    }
+
+    #[test]
+    fn code_copy_keeps_indentation_empty_lines_and_excludes_chrome() {
+        let document = laid_document("before\n\n```text\n  alpha\n\n\tbeta\n```\n\nafter", 320.0);
+        assert_eq!(
+            document.selected_text(0..document.text_len()),
+            "before\n\n  alpha\n\n\tbeta\n\nafter"
+        );
+        let code = document.text.find("  alpha").unwrap();
+        assert_eq!(
+            document.selected_text(document.paragraph_range(code)),
+            "  alpha"
+        );
+        let code_block = document
+            .blocks
+            .iter()
+            .find(|block| matches!(&block.kind, LayoutKind::Code { text: Some(_), .. }))
+            .unwrap();
+        assert_eq!(document.hit_test(16.0, code_block.y + 5.0, false), None);
+        assert!(document.hit_test(55.0, code_block.y + 5.0, false).is_some());
+    }
+
+    #[test]
+    fn table_copy_uses_tabs_and_rows_and_cell_paragraph_ranges() {
+        let document = laid_document(
+            "| A | B |\n|---|---|\n| **中** | e\u{301} |\n| C | D |",
+            320.0,
+        );
+        assert_eq!(
+            document.selected_text(0..document.text_len()),
+            "A\tB\n中\te\u{301}\nC\tD"
+        );
+        let cell = document.text.find('中').unwrap();
+        assert_eq!(document.selected_text(document.paragraph_range(cell)), "中");
+        assert_eq!(
+            document.selected_text(cell..document.text_len()),
+            "中\te\u{301}\nC\tD"
+        );
+    }
+
+    #[test]
+    fn skparagraph_rects_and_hits_round_trip_after_wrapping() {
+        let document = laid_document(
+            "Hello 中文 e\u{301} 👩‍💻 with enough words to wrap onto another line.",
+            140.0,
+        );
+        let text = document.selectable_at(document.selectable[0]);
+        assert!(text.paragraph.line_number() > 1);
+        let byte = document.text.find('中').unwrap();
+        let utf16 = text.text.byte_to_utf16(byte);
+        let boxes = text.paragraph.get_rects_for_range(
+            utf16..utf16 + 1,
+            RectHeightStyle::Max,
+            RectWidthStyle::Tight,
+        );
+        let rect = boxes
+            .first()
+            .expect("Chinese glyph has a real selection rectangle")
+            .rect;
+        assert!(rect.width() > 0.0 && rect.height() > 0.0);
+        let y = text.y + (rect.top + rect.bottom) * 0.5;
+        let left = document
+            .hit_test(text.x + rect.left + rect.width() * 0.1, y, false)
+            .unwrap();
+        let right = document
+            .hit_test(text.x + rect.right - rect.width() * 0.1, y, false)
+            .unwrap();
+        assert_eq!(left, byte);
+        assert_eq!(right, byte + '中'.len_utf8());
+        assert_eq!(document.selected_text(left..right), "中");
+        for grapheme in ["e\u{301}", "👩‍💻"] {
+            let start = document.text.find(grapheme).unwrap();
+            let end = start + grapheme.len();
+            let boxes = text.paragraph.get_rects_for_range(
+                text.text.byte_to_utf16(start)..text.text.byte_to_utf16(end),
+                RectHeightStyle::Max,
+                RectWidthStyle::Tight,
+            );
+            for area in boxes {
+                let rect = area.rect;
+                for fraction in [0.1, 0.4, 0.6, 0.9] {
+                    let hit = document
+                        .hit_test(
+                            text.x + rect.left + rect.width() * fraction,
+                            text.y + (rect.top + rect.bottom) * 0.5,
+                            false,
+                        )
+                        .unwrap();
+                    assert!(hit == start || hit == end, "hit {hit} splits {grapheme}");
+                }
+            }
+        }
+        assert_eq!(document.hit_test(0.0, -100.0, false), None);
+        assert_eq!(document.hit_test(0.0, -100.0, true), Some(0));
+        assert_eq!(
+            document.hit_test(0.0, document.height + 100.0, true),
+            Some(document.text_len())
+        );
+        let word = document.word_range(left);
+        assert!(
+            document.text.is_char_boundary(word.start) && document.text.is_char_boundary(word.end)
+        );
+    }
+
+    #[test]
+    fn selection_geometry_reuses_local_rects_and_replaces_only_changed_range() {
+        let source = "Long selected paragraph with 中文 and emoji 👩‍💻. ".repeat(100);
+        let document = laid_document(&source, 180.0);
+        let text = document.selectable_at(document.selectable[0]);
+        let end = text.text.boundaries.last().unwrap().utf16;
+        {
+            let first = text.text.selection_geometry(text.paragraph, 0..end);
+            let second = text.text.selection_geometry(text.paragraph, 0..end);
+            assert!(std::ptr::eq(&*first, &*second));
+            assert!(first.rects.len() > 20);
+            assert!(first.visible(500.0, 540.0).count() < first.rects.len() / 2);
+        }
+        let replacement = text.text.selection_geometry(text.paragraph, 0..4);
+        assert_eq!(replacement.range, 0..4);
+        assert!(replacement.rects.len() <= 2);
+    }
+
+    #[test]
+    fn selection_visibility_index_handles_overlapping_rect_heights() {
+        let geometry = SelectionGeometry::new(
+            0..4,
+            vec![
+                Rect::new(0.0, 110.0, 20.0, 120.0),
+                Rect::new(0.0, 30.0, 20.0, 40.0),
+                Rect::new(0.0, 0.0, 20.0, 100.0),
+                Rect::new(0.0, 10.0, 20.0, 20.0),
+            ],
+        );
+        let middle: Vec<_> = geometry.visible(50.0, 60.0).map(|rect| rect.top).collect();
+        assert_eq!(middle, vec![0.0]);
+        let end: Vec<_> = geometry
+            .visible(115.0, 119.0)
+            .map(|rect| rect.top)
+            .collect();
+        assert_eq!(end, vec![110.0]);
+        assert_eq!(geometry.visible(130.0, 140.0).count(), 0);
+    }
+
+    #[test]
+    fn word_hit_on_trailing_glyph_half_keeps_affinity_without_changing_caret() {
+        let document = laid_document("hello world", 320.0);
+        let text = document.selectable_at(document.selectable[0]);
+        let boxes =
+            text.paragraph
+                .get_rects_for_range(4..5, RectHeightStyle::Max, RectWidthStyle::Tight);
+        let rect = boxes.first().unwrap().rect;
+        let x = text.x + rect.left + rect.width() * 0.8;
+        let y = text.y + (rect.top + rect.bottom) * 0.5;
+        assert_eq!(document.hit_test(x, y, false), Some(5));
+        let word = document.hit_test_word(x, y, false).unwrap();
+        assert_eq!(word, 0..5);
+        assert_eq!(document.selected_text(word), "hello");
+
+        let boxes =
+            text.paragraph
+                .get_rects_for_range(6..7, RectHeightStyle::Max, RectWidthStyle::Tight);
+        let rect = boxes.first().unwrap().rect;
+        let word = document
+            .hit_test_word(text.x + rect.left + rect.width() * 0.2, y, false)
+            .unwrap();
+        assert_eq!(document.selected_text(word), "world");
     }
 }

@@ -1,5 +1,6 @@
 mod animation_check;
 mod camera;
+mod clipboard;
 mod documents;
 mod markdown;
 mod renderer;
@@ -68,7 +69,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "Markdown Atlas — native Rust + Skia/SkParagraph + Metal\n\n  cargo run --release\n  cargo run --release -- --dir /path/to/markdown\n  cargo run --release -- --demo-count 200\n  cargo run --release -- --smoke-test work/smoke\n  cargo run --release -- --animation-test work/animation\n\nControls: middle drag / Space+left drag to pan; wheel to smoothly zoom at cursor; F fit all; 1 actual size; R reset; L toggle overview detail. Click minimap to navigate. Drop a Markdown file or folder to load it.\n\nDefault: generate 72 real Markdown files in demo-markdown/ without overwriting existing files. macOS / Metal required."
+                        "Markdown Atlas — native Rust + Skia/SkParagraph + Metal\n\n  cargo run --release\n  cargo run --release -- --dir /path/to/markdown\n  cargo run --release -- --demo-count 200\n  cargo run --release -- --smoke-test work/smoke\n  cargo run --release -- --animation-test work/animation\n\nControls: left drag to select text; double-click word / triple-click paragraph; Shift+click to extend; Cmd+A select active document; Cmd+C copy; middle drag / Space+left drag to pan; wheel to smoothly zoom at cursor; F fit all; 1 actual size; R reset; L toggle overview detail. Click minimap to navigate. Drop a Markdown file or folder to load it.\n\nDefault: generate 72 real Markdown files in demo-markdown/ without overwriting existing files. macOS / Metal required."
                     );
                     return Ok(None);
                 }
@@ -104,9 +105,34 @@ struct App {
     motion: CameraMotion,
     animation_time: Option<Instant>,
     animation_check: Option<AnimationCheck>,
+    last_click: Option<(Instant, (f64, f64), u8)>,
+    selection_pan_time: Option<Instant>,
+    selection_drag_origin: Option<(f64, f64)>,
+    selection_drag_moved: bool,
 }
 
 impl App {
+    fn update_cursor(&self) {
+        if let Some(renderer) = &self.renderer {
+            let (width, height) = renderer.logical_size();
+            renderer.window.set_cursor(
+                if self.middle_down || (self.space_down && self.left_down) {
+                    CursorIcon::Grabbing
+                } else if self.space_down {
+                    CursorIcon::Grab
+                } else if self.scene.is_selecting()
+                    || self
+                        .scene
+                        .text_at(self.cursor.0, self.cursor.1, width, height)
+                {
+                    CursorIcon::Text
+                } else {
+                    CursorIcon::Default
+                },
+            );
+        }
+    }
+
     fn wait_for_event(&self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(
             self.animation_check
@@ -129,6 +155,7 @@ impl App {
         };
         if self.occluded {
             self.animation_time = None;
+            self.selection_pan_time = None;
             return;
         }
         // Layout happens once per file. Limiting it to one file per redraw keeps startup interactive.
@@ -199,6 +226,35 @@ impl App {
                 if !self.motion.is_active() {
                     self.animation_time = None;
                 }
+                let velocity = if self.scene.is_selecting()
+                    && self.left_down
+                    && !self.middle_down
+                    && !self.space_down
+                    && self.selection_drag_moved
+                {
+                    selection_scroll_velocity(self.cursor, width, height)
+                } else {
+                    (0.0, 0.0)
+                };
+                if velocity != (0.0, 0.0) {
+                    let dt = self
+                        .selection_pan_time
+                        .replace(now)
+                        .map_or(1.0 / 120.0, |previous| {
+                            now.duration_since(previous).as_secs_f64().min(0.05)
+                        });
+                    if !self
+                        .scene
+                        .pan_selection(velocity.0 * dt, velocity.1 * dt, width, height)
+                    {
+                        self.selection_pan_time = None;
+                    }
+                    self.motion.cancel(self.scene.camera);
+                    self.scene
+                        .update_selection(self.cursor.0, self.cursor.1, width, height);
+                } else {
+                    self.selection_pan_time = None;
+                }
                 self.scene.paint(canvas, width, height)
             })
         });
@@ -211,6 +267,7 @@ impl App {
             }
             Ok(false) => {
                 self.animation_time = None;
+                self.selection_pan_time = None;
                 if !renderer.window.is_minimized().unwrap_or(false) {
                     self.retry_draw = true;
                     event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -269,9 +326,14 @@ impl App {
         }
         // A wheel event starts an animation, rather than drawing just one zoom step.
         // Metal's synchronized drawable presentation provides frame pacing.
-        if !ready || self.smoke.is_some() || self.motion.is_active() {
+        if !ready
+            || self.smoke.is_some()
+            || self.motion.is_active()
+            || self.selection_pan_time.is_some()
+        {
             renderer.window.request_redraw();
         }
+        self.update_cursor();
         self.wait_for_event(event_loop);
     }
 }
@@ -331,11 +393,16 @@ impl ApplicationHandler for App {
                 self.occluded = occluded;
                 // Resume smoothly instead of treating time spent hidden as an animation frame.
                 self.animation_time = None;
+                self.selection_pan_time = None;
             }
             WindowEvent::Focused(false) => {
                 self.middle_down = false;
                 self.left_down = false;
                 self.space_down = false;
+                self.scene.finish_selection();
+                self.selection_pan_time = None;
+                self.selection_drag_origin = None;
+                self.selection_drag_moved = false;
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
@@ -346,9 +413,22 @@ impl ApplicationHandler for App {
                         .pan(p.x - self.cursor.0, p.y - self.cursor.1);
                     self.motion.cancel(self.scene.camera);
                     self.animation_time = None;
+                } else if self.left_down && self.scene.is_selecting() {
+                    if self
+                        .selection_drag_origin
+                        .is_some_and(|origin| (p.x - origin.0).hypot(p.y - origin.1) >= 4.0)
+                    {
+                        self.selection_drag_moved = true;
+                        self.last_click = None;
+                    }
+                    self.scene.update_selection(p.x, p.y, width, height);
                 }
                 self.cursor = (p.x, p.y);
-                if !self.middle_down && !(self.space_down && self.left_down) {
+                if !self.middle_down
+                    && !(self.space_down && self.left_down)
+                    && !self.scene.is_selecting()
+                {
+                    self.update_cursor();
                     return;
                 }
             }
@@ -359,16 +439,22 @@ impl ApplicationHandler for App {
                         self.middle_down = pressed;
                         if pressed {
                             self.motion.cancel(self.scene.camera);
+                            self.scene.finish_selection();
+                            self.last_click = None;
                         }
                     }
                     MouseButton::Left => {
                         self.left_down = pressed;
+                        self.selection_drag_origin = None;
+                        self.selection_drag_moved = false;
                         if pressed && self.space_down {
                             self.motion.cancel(self.scene.camera);
+                            self.scene.finish_selection();
+                            self.last_click = None;
                         }
-                        if pressed && !self.space_down {
+                        if pressed && !self.space_down && !self.middle_down {
                             let before = self.scene.camera;
-                            self.scene.navigate_minimap(
+                            let minimap = self.scene.navigate_minimap(
                                 self.cursor.0,
                                 self.cursor.1,
                                 width,
@@ -376,9 +462,39 @@ impl ApplicationHandler for App {
                             );
                             let destination = self.scene.camera;
                             self.scene.camera = before;
-                            if destination != before {
+                            if minimap {
+                                self.scene.finish_selection();
                                 self.motion.move_to(destination);
+                                self.last_click = None;
+                            } else {
+                                self.motion.cancel(self.scene.camera);
+                                let now = Instant::now();
+                                let count = self.last_click.map_or(1, |(at, point, count)| {
+                                    if now.duration_since(at).as_millis() <= 500
+                                        && (point.0 - self.cursor.0).hypot(point.1 - self.cursor.1)
+                                            <= 6.0
+                                    {
+                                        count % 3 + 1
+                                    } else {
+                                        1
+                                    }
+                                });
+                                self.last_click = Some((now, self.cursor, count));
+                                if self.scene.begin_selection(
+                                    self.cursor.0,
+                                    self.cursor.1,
+                                    width,
+                                    height,
+                                    count,
+                                    self.modifiers.shift_key(),
+                                ) {
+                                    self.selection_drag_origin = Some(self.cursor);
+                                }
                             }
+                        }
+                        if !pressed {
+                            self.scene.finish_selection();
+                            self.selection_pan_time = None;
                         }
                     }
                     _ => {}
@@ -392,6 +508,8 @@ impl ApplicationHandler for App {
                 if !amount.is_finite() || amount == 0.0 {
                     return;
                 }
+                self.scene.finish_selection();
+                self.last_click = None;
                 self.motion.zoom_at(
                     &self.scene.camera,
                     self.cursor.0,
@@ -403,24 +521,65 @@ impl ApplicationHandler for App {
                 let pressed = event.state == ElementState::Pressed;
                 if event.logical_key == Key::Named(NamedKey::Space) {
                     self.space_down = pressed;
+                    if pressed {
+                        self.scene.finish_selection();
+                    }
                 }
                 if pressed && !event.repeat {
+                    let navigation_key = match &event.logical_key {
+                        Key::Character(key) => ["f", "1", "r", "l"]
+                            .iter()
+                            .any(|name| key.eq_ignore_ascii_case(name)),
+                        Key::Named(
+                            NamedKey::ArrowLeft
+                            | NamedKey::ArrowRight
+                            | NamedKey::ArrowUp
+                            | NamedKey::ArrowDown,
+                        ) => true,
+                        _ => false,
+                    };
+                    if navigation_key {
+                        self.scene.finish_selection();
+                        self.selection_pan_time = None;
+                        self.last_click = None;
+                    }
                     match &event.logical_key {
-                        Key::Character(key) if key.eq_ignore_ascii_case("f") => {
+                        Key::Character(key)
+                            if key.eq_ignore_ascii_case("c") && self.modifiers.super_key() =>
+                        {
+                            if let Some(text) = self.scene.selected_text() {
+                                match clipboard::copy_text(&text) {
+                                    Ok(()) => self.scene.message = "已复制选中文字".into(),
+                                    Err(error) => self.scene.message = format!("复制失败：{error}"),
+                                }
+                            }
+                        }
+                        Key::Character(key)
+                            if key.eq_ignore_ascii_case("a") && self.modifiers.super_key() =>
+                        {
+                            self.scene.select_all();
+                        }
+                        Key::Character(key)
+                            if key.eq_ignore_ascii_case("f") && !self.modifiers.super_key() =>
+                        {
                             let mut destination = self.scene.camera;
                             destination.fit(self.scene.bounds, width, height - 38.0, TOP_BAR);
                             self.motion.move_to(destination);
                         }
-                        Key::Character(key) if key == "1" => {
+                        Key::Character(key) if key == "1" && !self.modifiers.super_key() => {
                             let mut destination = self.scene.camera;
                             destination.zoom_at(width / 2.0, height / 2.0, 1.0 / destination.scale);
                             self.motion.move_to(destination);
                         }
-                        Key::Character(key) if key.eq_ignore_ascii_case("r") => {
+                        Key::Character(key)
+                            if key.eq_ignore_ascii_case("r") && !self.modifiers.super_key() =>
+                        {
                             self.motion.move_to(Camera::default());
                             self.scene.message.clear();
                         }
-                        Key::Character(key) if key.eq_ignore_ascii_case("l") => {
+                        Key::Character(key)
+                            if key.eq_ignore_ascii_case("l") && !self.modifiers.super_key() =>
+                        {
                             self.scene.lod = !self.scene.lod
                         }
                         Key::Character(key)
@@ -433,6 +592,9 @@ impl ApplicationHandler for App {
                             self.left_down = false;
                             self.space_down = false;
                             self.motion.cancel(self.scene.camera);
+                            self.scene.clear_selection();
+                            self.last_click = None;
+                            self.selection_pan_time = None;
                             self.scene.message.clear();
                         }
                         Key::Named(NamedKey::ArrowLeft) => {
@@ -456,6 +618,8 @@ impl ApplicationHandler for App {
                     self.scene = Scene::new(documents);
                     self.motion.cancel(self.scene.camera);
                     self.animation_time = None;
+                    self.last_click = None;
+                    self.selection_pan_time = None;
                 }
                 Ok(_) => self.scene.message = "没有找到 Markdown 文件。按 R 返回。".into(),
                 Err(error) => {
@@ -470,17 +634,28 @@ impl ApplicationHandler for App {
         } else {
             self.animation_time = None;
         }
-        renderer
-            .window
-            .set_cursor(if self.middle_down || (self.space_down && self.left_down) {
-                CursorIcon::Grabbing
-            } else if self.space_down {
-                CursorIcon::Grab
-            } else {
-                CursorIcon::Default
-            });
         renderer.window.request_redraw();
+        self.update_cursor();
     }
+}
+
+/// Camera translation in logical pixels/sec, independent of zoom and refresh rate.
+fn selection_scroll_velocity(cursor: (f64, f64), width: f64, height: f64) -> (f64, f64) {
+    let edge = |position: f64, low: f64, high: f64| {
+        const BAND: f64 = 40.0;
+        const SPEED: f64 = 560.0;
+        if position < low + BAND {
+            ((low + BAND - position) / BAND).clamp(0.0, 1.0) * SPEED
+        } else if position > high - BAND {
+            -((position - high + BAND) / BAND).clamp(0.0, 1.0) * SPEED
+        } else {
+            0.0
+        }
+    };
+    (
+        edge(cursor.0, 0.0, width),
+        edge(cursor.1, TOP_BAR, height - 38.0),
+    )
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -521,6 +696,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         motion: CameraMotion::new(Camera::default()),
         animation_time: None,
         animation_check: options.animation_check.map(AnimationCheck::new),
+        last_click: None,
+        selection_pan_time: None,
+        selection_drag_origin: None,
+        selection_drag_moved: false,
     };
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);

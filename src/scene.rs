@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, ops::Range};
 
 use skia_safe::{
     Canvas, Color, Paint, Rect as SkRect,
@@ -29,6 +29,36 @@ struct Card {
     accent: Color,
 }
 
+struct DocumentHit {
+    card: (usize, usize),
+    offset: usize,
+    local: (f32, f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionUnit {
+    Character,
+    Word,
+    Paragraph,
+}
+
+#[derive(Clone, Debug)]
+struct Selection {
+    card: (usize, usize),
+    anchor: usize,
+    head: usize,
+    initial: Range<usize>,
+    unit: SelectionUnit,
+    dragging: bool,
+    character_count: usize,
+}
+
+impl Selection {
+    fn range(&self) -> Range<usize> {
+        self.anchor.min(self.head)..self.anchor.max(self.head)
+    }
+}
+
 pub struct Scene {
     pending: VecDeque<SourceDocument>,
     columns: Vec<Vec<Card>>,
@@ -40,6 +70,7 @@ pub struct Scene {
     controls: Paragraph,
     compact_controls: Paragraph,
     status: Option<(String, Paragraph)>,
+    selection: Option<Selection>,
     pub camera: Camera,
     pub bounds: Rect,
     pub total: usize,
@@ -69,14 +100,14 @@ impl Scene {
             heading: markdown::paragraph("MARKDOWN ATLAS", 19.0, INK, 320.0, &fonts),
             subtitle: markdown::paragraph("把文档展开，在空间里阅读。", 12.0, MUTED, 340.0, &fonts),
             controls: markdown::paragraph(
-                "中键 / 空格＋拖动    平移     ·     滚轮    缩放     ·     F    全览     ·     1    原比例     ·     R    起点     ·     L    远景细节",
+                "左键选字 · ⌘C 复制    |    中键 / 空格＋拖动 平移 · 滚轮缩放 · F 全览 · 1 原比例 · R 起点 · L 远景细节",
                 12.0,
                 MUTED,
                 1100.0,
                 &fonts,
             ),
             compact_controls: markdown::paragraph(
-                "中键拖动 · 滚轮缩放 · F 全览 · 1 原比例 · R 起点 · L 细节",
+                "左键选字 · ⌘C 复制 · 中键平移 · 滚轮缩放 · F 全览 · R 起点",
                 12.0,
                 MUTED,
                 700.0,
@@ -98,12 +129,319 @@ impl Scene {
             lod: true,
             frame_ms: 0.0,
             status: None,
+            selection: None,
             message: String::new(),
         }
     }
 
     pub fn ready(&self) -> bool {
         self.pending.is_empty()
+    }
+
+    fn card(&self, id: (usize, usize)) -> Option<&Card> {
+        self.columns.get(id.0)?.get(id.1)
+    }
+
+    fn document_hit(&self, x: f64, y: f64, width: f64, height: f64) -> Option<DocumentHit> {
+        if ![x, y, width, height].iter().all(|value| value.is_finite())
+            || width <= 0.0
+            || height <= TOP_BAR + 38.0
+            || x < 0.0
+            || x > width
+            || y < TOP_BAR
+            || y >= height - 38.0
+            || (self.lod && self.camera.scale < 0.12)
+        {
+            return None;
+        }
+        let minimap = self.minimap_rect(width, height);
+        if self.ready()
+            && x >= minimap.x
+            && x <= minimap.right()
+            && y >= minimap.y
+            && y <= minimap.bottom()
+        {
+            return None;
+        }
+        let (world_x, world_y) = self.camera.screen_to_world(x, y);
+        if !world_x.is_finite() || !world_y.is_finite() || world_x < 0.0 {
+            return None;
+        }
+        let column_index = (world_x / (CARD_WIDTH + GAP)).floor() as usize;
+        let column = self.columns.get(column_index)?;
+        let row = column.partition_point(|card| card.rect.bottom() < world_y);
+        let card = column.get(row)?;
+        let local_x = world_x - card.rect.x - PADDING as f64;
+        let local_y = world_y - card.rect.y - CONTENT_TOP as f64;
+        let content_width = CARD_WIDTH - PADDING as f64 * 2.0;
+        let content_height = card.body.height as f64;
+        // Camera inversion can put an exact paragraph edge a few ulps outside
+        // the content rectangle. Admit only that subpixel error, then snap it
+        // back before handing coordinates to SkParagraph's strict hit test.
+        const HIT_EPSILON: f64 = 0.00001;
+        if local_x < -HIT_EPSILON
+            || local_x > content_width + HIT_EPSILON
+            || local_y < -HIT_EPSILON
+            || local_y > content_height + HIT_EPSILON
+        {
+            return None;
+        }
+        let local = (
+            local_x.clamp(0.0, content_width) as f32,
+            local_y.clamp(0.0, content_height) as f32,
+        );
+        card.body
+            .hit_test(local.0, local.1, false)
+            .map(|offset| DocumentHit {
+                card: (column_index, row),
+                offset,
+                local,
+            })
+    }
+
+    pub fn text_at(&self, x: f64, y: f64, width: f64, height: f64) -> bool {
+        self.document_hit(x, y, width, height).is_some()
+    }
+
+    pub fn begin_selection(
+        &mut self,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        click_count: u8,
+        extend: bool,
+    ) -> bool {
+        self.message.clear();
+        let Some(hit) = self.document_hit(x, y, width, height) else {
+            self.clear_selection();
+            return false;
+        };
+        let id = hit.card;
+        let offset = hit.offset;
+        if extend
+            && let Some(selection) = &mut self.selection
+            && selection.card == id
+        {
+            selection.head = offset;
+            selection.initial = selection.anchor..selection.anchor;
+            selection.unit = SelectionUnit::Character;
+            selection.dragging = true;
+            self.update_selection_count();
+            return true;
+        }
+        let body = &self.card(id).expect("Hit-tested card exists").body;
+        let (unit, range) = match click_count {
+            0 | 1 => (SelectionUnit::Character, offset..offset),
+            2 => {
+                let Some(range) = body.hit_test_word(hit.local.0, hit.local.1, false) else {
+                    self.clear_selection();
+                    return false;
+                };
+                (SelectionUnit::Word, range)
+            }
+            _ => (SelectionUnit::Paragraph, body.paragraph_range(offset)),
+        };
+        self.selection = Some(Selection {
+            card: id,
+            anchor: range.start,
+            head: range.end,
+            initial: range,
+            unit,
+            dragging: true,
+            character_count: 0,
+        });
+        self.update_selection_count();
+        true
+    }
+
+    pub fn update_selection(&mut self, x: f64, y: f64, width: f64, height: f64) -> bool {
+        if ![x, y, width, height].iter().all(|value| value.is_finite())
+            || width <= 0.0
+            || height <= TOP_BAR + 38.0
+        {
+            return false;
+        }
+        let Some(selection) = &self.selection else {
+            return false;
+        };
+        if !selection.dragging {
+            return false;
+        }
+        let Some(card) = self.card(selection.card) else {
+            return false;
+        };
+        // Edge auto-pan moves the camera separately. Keep the drag endpoint at the
+        // readable viewport edge so the footer and title bar do not select hidden text.
+        let (world_x, world_y) = self
+            .camera
+            .screen_to_world(x.clamp(0.0, width), y.clamp(TOP_BAR, height - 38.0));
+        let local_x = world_x - card.rect.x - PADDING as f64;
+        let local_y = world_y - card.rect.y - CONTENT_TOP as f64;
+        if !local_x.is_finite() || !local_y.is_finite() {
+            return false;
+        }
+        let (anchor, head) = match selection.unit {
+            SelectionUnit::Character => {
+                let Some(offset) = card.body.hit_test(local_x as f32, local_y as f32, true) else {
+                    return false;
+                };
+                (selection.anchor, offset)
+            }
+            unit => {
+                let range = match unit {
+                    SelectionUnit::Word => {
+                        card.body
+                            .hit_test_word(local_x as f32, local_y as f32, true)
+                    }
+                    SelectionUnit::Paragraph => card
+                        .body
+                        .hit_test(local_x as f32, local_y as f32, true)
+                        .map(|offset| card.body.paragraph_range(offset)),
+                    SelectionUnit::Character => unreachable!(),
+                };
+                let Some(range) = range else {
+                    return false;
+                };
+                if range.start < selection.initial.start {
+                    (selection.initial.end, range.start)
+                } else if range.end > selection.initial.end {
+                    (selection.initial.start, range.end)
+                } else {
+                    (selection.initial.start, selection.initial.end)
+                }
+            }
+        };
+        if selection.anchor == anchor && selection.head == head {
+            return false;
+        }
+        let selection = self.selection.as_mut().expect("Selection remains active");
+        selection.anchor = anchor;
+        selection.head = head;
+        self.update_selection_count();
+        true
+    }
+
+    pub fn pan_selection(&mut self, dx: f64, dy: f64, width: f64, height: f64) -> bool {
+        const EDGE_INSET: f64 = 24.0;
+        if !self.is_selecting()
+            || ![dx, dy, width, height]
+                .iter()
+                .all(|value| value.is_finite())
+            || width <= EDGE_INSET * 2.0
+            || height <= TOP_BAR + 38.0 + EDGE_INSET * 2.0
+        {
+            return false;
+        }
+        let Some(selection) = &self.selection else {
+            return false;
+        };
+        let Some(card) = self.card(selection.card) else {
+            return false;
+        };
+        let top_left = self.camera.world_to_screen(
+            card.rect.x + PADDING as f64,
+            card.rect.y + CONTENT_TOP as f64,
+        );
+        let bottom_right = self.camera.world_to_screen(
+            card.rect.right() - PADDING as f64,
+            card.rect.y + CONTENT_TOP as f64 + card.body.height as f64,
+        );
+        if ![top_left.0, top_left.1, bottom_right.0, bottom_right.1]
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return false;
+        }
+        // A short document may already fit between both limits, and the camera
+        // may begin outside them. Clamp only the requested direction, never snap
+        // an existing position back into bounds as a side effect of dragging.
+        let limit_axis = |delta: f64, start: f64, end: f64, min: f64, max: f64| {
+            if delta < 0.0 {
+                delta.max((max - end).min(0.0))
+            } else {
+                delta.min((min - start).max(0.0))
+            }
+        };
+        let dx = limit_axis(
+            dx,
+            top_left.0,
+            bottom_right.0,
+            EDGE_INSET,
+            width - EDGE_INSET,
+        );
+        let dy = limit_axis(
+            dy,
+            top_left.1,
+            bottom_right.1,
+            TOP_BAR + EDGE_INSET,
+            height - 38.0 - EDGE_INSET,
+        );
+        let before = self.camera;
+        self.camera.pan(dx, dy);
+        self.camera != before
+    }
+
+    fn update_selection_count(&mut self) {
+        let count = self
+            .selection
+            .as_ref()
+            .and_then(|selection| {
+                self.card(selection.card)
+                    .map(|card| card.body.selection_char_count(selection.range()))
+            })
+            .unwrap_or(0);
+        if let Some(selection) = &mut self.selection {
+            selection.character_count = count;
+        }
+    }
+
+    pub fn finish_selection(&mut self) {
+        if let Some(selection) = &mut self.selection {
+            selection.dragging = false;
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.as_ref()?;
+        let range = selection.range();
+        if range.is_empty() {
+            return None;
+        }
+        let text = self.card(selection.card)?.body.selected_text(range);
+        (!text.is_empty()).then_some(text)
+    }
+
+    pub fn select_all(&mut self) -> bool {
+        let Some(selection) = &self.selection else {
+            return false;
+        };
+        let Some(card) = self.card(selection.card) else {
+            return false;
+        };
+        let len = card.body.text_len();
+        if len == 0 {
+            return false;
+        }
+        self.message.clear();
+        let selection = self.selection.as_mut().expect("Selection remains active");
+        selection.anchor = 0;
+        selection.head = len;
+        selection.initial = 0..len;
+        selection.unit = SelectionUnit::Character;
+        selection.dragging = false;
+        self.update_selection_count();
+        true
+    }
+
+    pub fn is_selecting(&self) -> bool {
+        self.selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging)
     }
 
     pub fn build_next(&mut self) {
@@ -198,13 +536,17 @@ impl Scene {
         let origin = self.camera.world_to_screen(0.0, 0.0);
         canvas.translate((origin.0 as f32, origin.1 as f32));
         canvas.scale((self.camera.scale as f32, self.camera.scale as f32));
+        let selected = self.selection.as_ref().and_then(|selection| {
+            let range = selection.range();
+            (!range.is_empty()).then_some((selection.card, range))
+        });
         for (column_index, column) in self.columns.iter().enumerate() {
             let column_x = column_index as f64 * (CARD_WIDTH + GAP);
             if column_x > visible.right() || column_x + CARD_WIDTH < visible.x {
                 continue;
             }
             let start = column.partition_point(|card| card.rect.bottom() < visible.y);
-            for card in &column[start..] {
+            for (row, card) in column.iter().enumerate().skip(start) {
                 if card.rect.y > visible.bottom() {
                     break;
                 }
@@ -248,6 +590,9 @@ impl Scene {
                         canvas,
                         (visible.y - card.rect.y) as f32 - CONTENT_TOP,
                         (visible.bottom() - card.rect.y) as f32 - CONTENT_TOP,
+                        selected.as_ref().and_then(|(id, range)| {
+                            (*id == (column_index, row)).then(|| range.clone())
+                        }),
                     );
                 } else {
                     card.summary.paint(canvas, (40.0, 100.0));
@@ -323,6 +668,13 @@ impl Scene {
         self.subtitle.paint(canvas, (28.0, 48.0));
         let status = if !self.message.is_empty() {
             self.message.clone()
+        } else if let Some(selection) = &self.selection
+            && selection.character_count > 0
+        {
+            format!(
+                "已选择 {} 个字符 · ⌘C 复制\nShift＋点击延伸 · 双击选词 · 三击选段落",
+                selection.character_count
+            )
         } else if !self.ready() {
             format!("正在排版  {}/{}  份 Markdown…", self.loaded, self.total)
         } else if width < 1100.0 {
@@ -466,5 +818,285 @@ impl Scene {
             &paint,
         );
         canvas.restore();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const WIDTH: f64 = 1440.0;
+    const HEIGHT: f64 = 940.0;
+
+    fn source(name: &str, text: &str) -> SourceDocument {
+        SourceDocument {
+            path: PathBuf::from(name),
+            title: name.into(),
+            markdown: text.into(),
+            line_count: text.lines().count(),
+        }
+    }
+
+    fn scene() -> Scene {
+        let mut scene = Scene::new(vec![source(
+            "selection.md",
+            "hello **world** 中文\n\nA second paragraph.\n",
+        )]);
+        while !scene.ready() {
+            scene.build_next();
+        }
+        scene
+    }
+
+    fn text_point(scene: &Scene, wanted_offset: usize) -> (f64, f64) {
+        let card = &scene.columns[0][0];
+        for y in (1..card.body.height.ceil() as usize).step_by(2) {
+            for x in (1..CARD_WIDTH as usize - PADDING as usize * 2).step_by(2) {
+                if card.body.hit_test(x as f32, y as f32, false) == Some(wanted_offset) {
+                    return scene.camera.world_to_screen(
+                        card.rect.x + PADDING as f64 + x as f64,
+                        card.rect.y + CONTENT_TOP as f64 + y as f64,
+                    );
+                }
+            }
+        }
+        panic!("No glyph hit point for offset {wanted_offset}");
+    }
+
+    #[test]
+    fn word_and_paragraph_selection_use_rendered_text() {
+        let mut scene = scene();
+        let point = text_point(&scene, 1);
+        assert!(scene.begin_selection(point.0, point.1, WIDTH, HEIGHT, 2, false));
+        assert_eq!(scene.selected_text().as_deref(), Some("hello"));
+        assert!(scene.is_selecting());
+        scene.finish_selection();
+        assert!(!scene.is_selecting());
+        assert!(scene.begin_selection(point.0, point.1, WIDTH, HEIGHT, 3, false));
+        let text = scene.selected_text().unwrap();
+        assert!(text.contains("hello world 中文"));
+        assert!(!text.contains("**"));
+        assert!(!text.contains("second paragraph"));
+    }
+
+    #[test]
+    fn word_selection_uses_glyph_affinity_while_character_selection_keeps_caret() {
+        let mut scene = scene();
+        // The first hit at this caret is the trailing half of the final "o".
+        // A plain word_range(5) would instead choose the following space.
+        let hello_end = text_point(&scene, 5);
+        let world_end = text_point(&scene, 11);
+        let body = &scene.columns[0][0].body;
+        assert_eq!(body.selected_text(body.word_range(5)), " ");
+
+        assert!(scene.begin_selection(hello_end.0, hello_end.1, WIDTH, HEIGHT, 2, false));
+        assert_eq!(scene.selected_text().as_deref(), Some("hello"));
+        assert!(!scene.update_selection(hello_end.0, hello_end.1, WIDTH, HEIGHT));
+        assert!(scene.update_selection(world_end.0, world_end.1, WIDTH, HEIGHT));
+        assert_eq!(scene.selected_text().as_deref(), Some("hello world"));
+        assert!(scene.update_selection(hello_end.0, hello_end.1, WIDTH, HEIGHT));
+        assert_eq!(scene.selected_text().as_deref(), Some("hello"));
+
+        assert!(scene.begin_selection(world_end.0, world_end.1, WIDTH, HEIGHT, 2, false));
+        assert_eq!(scene.selected_text().as_deref(), Some("world"));
+        assert!(scene.update_selection(hello_end.0, hello_end.1, WIDTH, HEIGHT));
+        assert_eq!(scene.selected_text().as_deref(), Some("hello world"));
+
+        assert!(scene.begin_selection(hello_end.0, hello_end.1, WIDTH, HEIGHT, 1, false));
+        assert_eq!(scene.selection.as_ref().unwrap().anchor, 5);
+        assert!(scene.selected_text().is_none());
+        assert!(scene.update_selection(world_end.0, world_end.1, WIDTH, HEIGHT));
+        assert_eq!(scene.selected_text().as_deref(), Some(" world"));
+    }
+
+    #[test]
+    fn selection_and_hit_testing_survive_camera_pan_and_zoom() {
+        let mut scene = scene();
+        let point = text_point(&scene, 1);
+        let world = scene.camera.screen_to_world(point.0, point.1);
+        assert!(scene.begin_selection(point.0, point.1, WIDTH, HEIGHT, 3, false));
+        scene.finish_selection();
+        let selected = scene.selected_text();
+        scene.camera.zoom_at(0.0, 0.0, 1.5);
+        scene.camera.pan(60.0, 20.0);
+        let transformed = scene.camera.world_to_screen(world.0, world.1);
+        assert!(scene.text_at(transformed.0, transformed.1, WIDTH, HEIGHT));
+        assert_eq!(scene.selected_text(), selected);
+    }
+
+    #[test]
+    fn paragraph_edges_tolerate_camera_roundoff_without_selecting_header_or_padding() {
+        let scene = scene();
+        let card = &scene.columns[0][0];
+        for local in [(6.0, 0.0), (0.0, 2.0)] {
+            let expected = card.body.hit_test(local.0 as f32, local.1 as f32, false);
+            assert!(expected.is_some());
+            let screen = scene.camera.world_to_screen(
+                card.rect.x + PADDING as f64 + local.0,
+                card.rect.y + CONTENT_TOP as f64 + local.1,
+            );
+            assert_eq!(
+                scene
+                    .document_hit(screen.0, screen.1, WIDTH, HEIGHT)
+                    .map(|hit| (hit.card, hit.offset)),
+                expected.map(|offset| ((0, 0), offset))
+            );
+        }
+        for local in [(6.0, -0.01), (-0.01, 2.0)] {
+            let screen = scene.camera.world_to_screen(
+                card.rect.x + PADDING as f64 + local.0,
+                card.rect.y + CONTENT_TOP as f64 + local.1,
+            );
+            assert!(!scene.text_at(screen.0, screen.1, WIDTH, HEIGHT));
+        }
+    }
+
+    #[test]
+    fn drag_stays_in_its_original_card_and_blank_click_clears_active_card() {
+        let mut scene = Scene::new(vec![
+            source("first.md", "First card only.\n"),
+            source("second.md", "Do not select this other card.\n"),
+        ]);
+        while !scene.ready() {
+            scene.build_next();
+        }
+        let point = text_point(&scene, 0);
+        assert!(scene.begin_selection(point.0, point.1, WIDTH, HEIGHT, 1, false));
+        assert!(scene.update_selection(WIDTH + 100.0, HEIGHT + 100.0, WIDTH, HEIGHT));
+        assert_eq!(scene.selection.as_ref().unwrap().card, (0, 0));
+        assert_eq!(
+            scene.selected_text(),
+            Some(
+                scene.columns[0][0]
+                    .body
+                    .selected_text(0..scene.columns[0][0].body.text_len())
+            )
+        );
+        assert!(!scene.selected_text().unwrap().contains("other card"));
+        scene.finish_selection();
+        assert!(!scene.begin_selection(WIDTH - 10.0, TOP_BAR + 10.0, WIDTH, HEIGHT, 1, false));
+        assert!(scene.selected_text().is_none());
+        assert!(!scene.select_all());
+    }
+
+    #[test]
+    fn headers_overlays_and_hidden_lod_text_cannot_start_selection() {
+        let mut scene = scene();
+        let point = text_point(&scene, 1);
+        assert!(scene.text_at(point.0, point.1, WIDTH, HEIGHT));
+        let header = scene.camera.world_to_screen(60.0, 30.0);
+        assert!(!scene.text_at(header.0, header.1, WIDTH, HEIGHT));
+        assert!(!scene.text_at(point.0, 30.0, WIDTH, HEIGHT));
+        assert!(!scene.text_at(point.0, HEIGHT - 10.0, WIDTH, HEIGHT));
+        let minimap = scene.minimap_rect(WIDTH, HEIGHT);
+        assert!(!scene.text_at(minimap.x + 20.0, minimap.y + 20.0, WIDTH, HEIGHT));
+        scene.camera.zoom_at(point.0, point.1, 0.1);
+        assert!(!scene.text_at(point.0, point.1, WIDTH, HEIGHT));
+        scene.lod = false;
+        assert!(scene.text_at(point.0, point.1, WIDTH, HEIGHT));
+    }
+
+    #[test]
+    fn shift_extension_retains_anchor_and_select_all_uses_active_card() {
+        let mut scene = scene();
+        let start = text_point(&scene, 1);
+        let end = text_point(&scene, 9);
+        assert!(scene.begin_selection(start.0, start.1, WIDTH, HEIGHT, 1, false));
+        scene.finish_selection();
+        assert!(scene.begin_selection(end.0, end.1, WIDTH, HEIGHT, 1, true));
+        let selection = scene.selection.as_ref().unwrap();
+        assert_eq!(selection.anchor, 1);
+        assert_eq!(selection.head, 9);
+        scene.message = "已复制旧选区".into();
+        assert!(scene.select_all());
+        assert!(scene.message.is_empty());
+        assert!(!scene.is_selecting());
+        let body = &scene.columns[0][0].body;
+        assert_eq!(
+            scene.selected_text(),
+            Some(body.selected_text(0..body.text_len()))
+        );
+    }
+
+    #[test]
+    fn selection_auto_pan_stops_at_both_ends_of_a_large_document() {
+        let text = "A long document paragraph with enough content for scrolling.\n\n".repeat(100);
+        let mut scene = Scene::new(vec![source("long.md", &text)]);
+        scene.build_next();
+        let point = text_point(&scene, 1);
+        assert!(scene.begin_selection(point.0, point.1, WIDTH, HEIGHT, 1, false));
+        scene.camera = Camera {
+            x: -400.0,
+            y: -600.0,
+            scale: 3.0,
+        };
+        assert!(scene.pan_selection(-1.0e6, -1.0e6, WIDTH, HEIGHT));
+        let card = &scene.columns[0][0];
+        let bottom_right = scene.camera.world_to_screen(
+            card.rect.right() - PADDING as f64,
+            card.rect.y + CONTENT_TOP as f64 + card.body.height as f64,
+        );
+        assert!((bottom_right.0 - (WIDTH - 24.0)).abs() < 1.0e-8);
+        assert!((bottom_right.1 - (HEIGHT - 38.0 - 24.0)).abs() < 1.0e-8);
+        assert!(!scene.pan_selection(-100.0, -100.0, WIDTH, HEIGHT));
+        assert!(scene.pan_selection(1.0e6, 1.0e6, WIDTH, HEIGHT));
+        let card = &scene.columns[0][0];
+        let top_left = scene.camera.world_to_screen(
+            card.rect.x + PADDING as f64,
+            card.rect.y + CONTENT_TOP as f64,
+        );
+        assert!((top_left.0 - 24.0).abs() < 1.0e-8);
+        assert!((top_left.1 - (TOP_BAR + 24.0)).abs() < 1.0e-8);
+        assert!(!scene.pan_selection(100.0, 100.0, WIDTH, HEIGHT));
+    }
+
+    #[test]
+    fn selection_auto_pan_does_not_push_short_content_away_or_snap_existing_offsets() {
+        let mut scene = scene();
+        let point = text_point(&scene, 1);
+        assert!(scene.begin_selection(point.0, point.1, WIDTH, HEIGHT, 1, false));
+        let before = scene.camera;
+        assert!(!scene.pan_selection(-1000.0, -1000.0, WIDTH, HEIGHT));
+        assert!(!scene.pan_selection(1000.0, 1000.0, WIDTH, HEIGHT));
+        assert_eq!(scene.camera, before);
+
+        scene.camera.x = -200.0;
+        scene.camera.y = -100.0;
+        let outside = scene.camera;
+        assert!(!scene.pan_selection(-1000.0, -1000.0, WIDTH, HEIGHT));
+        assert_eq!(scene.camera, outside);
+        assert!(scene.pan_selection(10.0, 10.0, WIDTH, HEIGHT));
+        assert_eq!(scene.camera.x, outside.x + 10.0);
+        assert_eq!(scene.camera.y, outside.y + 10.0);
+        assert!(scene.pan_selection(1000.0, 1000.0, WIDTH, HEIGHT));
+        let card = &scene.columns[0][0];
+        let top_left = scene.camera.world_to_screen(
+            card.rect.x + PADDING as f64,
+            card.rect.y + CONTENT_TOP as f64,
+        );
+        assert!((top_left.0 - 24.0).abs() < 1.0e-8);
+        assert!((top_left.1 - (TOP_BAR + 24.0)).abs() < 1.0e-8);
+        assert!(!scene.pan_selection(1000.0, 1000.0, WIDTH, HEIGHT));
+        assert!(!scene.pan_selection(-1000.0, -1000.0, WIDTH, HEIGHT));
+    }
+
+    #[test]
+    fn selection_auto_pan_requires_an_active_drag_and_valid_dimensions() {
+        let mut scene = scene();
+        let before = scene.camera;
+        assert!(!scene.pan_selection(100.0, 100.0, WIDTH, HEIGHT));
+        assert_eq!(scene.camera, before);
+        let point = text_point(&scene, 1);
+        assert!(scene.begin_selection(point.0, point.1, WIDTH, HEIGHT, 1, false));
+        scene.camera.x = -200.0;
+        let before = scene.camera;
+        assert!(!scene.pan_selection(f64::NAN, 0.0, WIDTH, HEIGHT));
+        assert!(!scene.pan_selection(100.0, 0.0, 10.0, HEIGHT));
+        assert!(!scene.pan_selection(100.0, 0.0, WIDTH, 100.0));
+        assert_eq!(scene.camera, before);
+        scene.finish_selection();
+        assert!(!scene.pan_selection(100.0, 0.0, WIDTH, HEIGHT));
+        assert_eq!(scene.camera, before);
     }
 }
