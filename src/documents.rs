@@ -1,3 +1,5 @@
+use ignore::WalkBuilder;
+
 use std::{
     error::Error,
     fmt::Write as _,
@@ -8,12 +10,30 @@ use std::{
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+const MAX_ENTRIES: usize = 20_000;
+const MAX_DOCUMENTS: usize = 2_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DocumentKind {
+    Markdown,
+    Code(String),
+    Text,
+}
+
+pub struct ImportResult {
+    pub documents: Vec<SourceDocument>,
+    /// Display paths include the selected root folder, including empty folders.
+    pub folders: Vec<PathBuf>,
+    pub warnings: Vec<String>,
+}
 
 pub struct SourceDocument {
     pub path: PathBuf,
     pub title: String,
     pub markdown: String,
     pub line_count: usize,
+    pub kind: DocumentKind,
+    pub relative_path: PathBuf,
 }
 
 struct Topic {
@@ -161,124 +181,246 @@ pub fn ensure_demo_documents(dir: &Path, count: usize) -> Result<(), Box<dyn Err
     Ok(())
 }
 
-/// Read Markdown files only; never follow links outside the requested tree.
-pub fn load_documents(dir: &Path) -> Result<Vec<SourceDocument>, Box<dyn Error>> {
-    if !dir.is_dir() && !dir.is_file() {
+/// Import a read-only snapshot of a directory or one UTF-8 text file.
+/// Links, ignored entries and generated dependency/output folders are not traversed.
+pub fn load_workspace(path: &Path) -> Result<ImportResult, Box<dyn Error>> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|err| contextual(path, "无法打开文件或目录", err))?;
+    if metadata.file_type().is_symlink() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("Markdown 文件或目录不存在：{}", dir.display()),
+            format!("不跟随符号链接，请选择实际文件或目录：{}", path.display()),
         )
         .into());
     }
-    let mut pending = if dir.is_dir() {
-        vec![dir.to_owned()]
-    } else {
-        Vec::new()
+    if !metadata.is_dir() && !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("请选择普通文件或目录：{}", path.display()),
+        )
+        .into());
+    }
+    let root = path
+        .canonicalize()
+        .map_err(|err| contextual(path, "无法解析路径", err))?;
+    let mut result = ImportResult {
+        documents: Vec::new(),
+        folders: Vec::new(),
+        warnings: Vec::new(),
     };
-    let mut paths = if dir.is_file() {
-        if !is_markdown(dir) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("请选择 .md 或 .markdown 文件：{}", dir.display()),
-            )
-            .into());
+    let root_name = PathBuf::from(
+        root.file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("root")),
+    );
+    if metadata.is_file() {
+        result.documents.push(read_document(&root, root_name)?);
+        return Ok(result);
+    }
+
+    result.folders.push(root_name.clone());
+    let mut paths = Vec::new();
+    let walker = WalkBuilder::new(&root)
+        .hidden(false)
+        .require_git(false)
+        .git_global(false)
+        .ignore(false)
+        .follow_links(false)
+        .sort_by_file_path(|a, b| a.cmp(b))
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || (entry.file_name() != ".git"
+                    && (!entry.file_type().is_some_and(|kind| kind.is_dir())
+                        || !ignored_directory(&entry.file_name().to_string_lossy())))
+        })
+        .build();
+    for (index, entry) in walker.enumerate() {
+        if index > MAX_ENTRIES {
+            result.warnings.push(format!(
+                "目录条目超过 {MAX_ENTRIES} 个，已停止扫描；请选择更小的子目录：{}",
+                root.display()
+            ));
+            break;
         }
-        vec![dir.to_owned()]
-    } else {
-        Vec::new()
-    };
-    while let Some(folder) = pending.pop() {
-        for entry in
-            fs::read_dir(&folder).map_err(|err| contextual(&folder, "无法读取目录", err))?
-        {
-            let entry = entry.map_err(|err| contextual(&folder, "无法读取目录条目", err))?;
-            let path = entry.path();
-            let kind = entry
-                .file_type()
-                .map_err(|err| contextual(&path, "无法读取文件类型", err))?;
-            if kind.is_symlink() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                result.warnings.push(format!("已跳过无法读取的条目：{err}"));
                 continue;
             }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') {
-                continue;
-            }
-            if kind.is_dir() {
-                if !matches!(name.as_ref(), "target" | "node_modules" | "dist" | "build") {
-                    pending.push(path);
-                }
-            } else if kind.is_file() && is_markdown(&path) {
-                paths.push(path);
-            }
+        };
+        if entry.depth() == 0 {
+            continue;
+        }
+        let Some(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
+            result
+                .folders
+                .push(root_name.join(entry.path().strip_prefix(&root)?));
+        } else if kind.is_file() {
+            paths.push(entry.into_path());
         }
     }
     paths.sort();
-    let mut total = 0usize;
-    let mut documents = Vec::with_capacity(paths.len());
+    result.folders.sort();
+    let mut total_bytes = 0usize;
     for path in paths {
-        let file =
-            fs::File::open(&path).map_err(|err| contextual(&path, "无法打开 Markdown", err))?;
-        let length = file
-            .metadata()
-            .map_err(|err| contextual(&path, "无法读取文件大小", err))?
-            .len();
-        if length > MAX_FILE_BYTES {
-            return Err(size_error(&path).into());
+        if result.documents.len() >= MAX_DOCUMENTS {
+            result.warnings.push(format!(
+                "已达到 {MAX_DOCUMENTS} 份文本的导入上限；请选择更小的子目录：{}",
+                root.display()
+            ));
+            break;
         }
-        let mut bytes = Vec::with_capacity(length as usize);
-        file.take(MAX_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|err| contextual(&path, "无法读取 Markdown", err))?;
-        if bytes.len() as u64 > MAX_FILE_BYTES {
-            return Err(size_error(&path).into());
+        let relative = root_name.join(path.strip_prefix(&root)?);
+        match read_document(&path, relative) {
+            Ok(document) => {
+                if total_bytes.saturating_add(document.markdown.len()) > MAX_TOTAL_BYTES {
+                    result.warnings.push(format!(
+                        "总文本超过 128 MiB，已停止读取；请选择更小的子目录：{}",
+                        root.display()
+                    ));
+                    break;
+                }
+                total_bytes += document.markdown.len();
+                result.documents.push(document);
+            }
+            Err(err) => result.warnings.push(format!("已跳过：{err}")),
         }
-        total = total.saturating_add(bytes.len());
-        if total > MAX_TOTAL_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Markdown 总内容超过 128 MiB，请选择更小的子目录：{}",
-                    dir.display()
-                ),
-            )
-            .into());
-        }
-        let markdown = String::from_utf8(bytes).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "文件不是 UTF-8，请转换编码后重试：{}（{err}）",
-                    path.display()
-                ),
-            )
-        })?;
-        let markdown = markdown
-            .trim_start_matches('\u{feff}')
-            .replace("\r\n", "\n")
-            .replace('\r', "\n");
-        let title = document_title(&markdown).unwrap_or_else(|| {
-            path.file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        });
-        let line_count = markdown.lines().count();
-        documents.push(SourceDocument {
-            path,
-            title,
-            markdown,
-            line_count,
-        });
     }
-    if documents.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("没有找到 .md 或 .markdown 文件：{}", dir.display()),
+    Ok(result)
+}
+
+/// Compatibility helper for callers that do not need folder metadata or notices.
+#[cfg(test)]
+pub fn load_documents(path: &Path) -> Result<Vec<SourceDocument>, Box<dyn Error>> {
+    Ok(load_workspace(path)?.documents)
+}
+
+fn ignored_directory(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".hg"
+            | ".svn"
+            | "target"
+            | "node_modules"
+            | "dist"
+            | "build"
+            | "vendor"
+            | "__pycache__"
+            | "coverage"
+            | ".cache"
+            | ".next"
+            | ".nuxt"
+            | ".venv"
+            | "venv"
+    )
+}
+
+fn read_document(path: &Path, relative_path: PathBuf) -> Result<SourceDocument, io::Error> {
+    let file = fs::File::open(path).map_err(|err| contextual(path, "无法打开文本", err))?;
+    let length = file
+        .metadata()
+        .map_err(|err| contextual(path, "无法读取文件大小", err))?
+        .len();
+    if length > MAX_FILE_BYTES {
+        return Err(size_error(path));
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| contextual(path, "无法读取文本", err))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(size_error(path));
+    }
+    let source = String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("文件不是 UTF-8 文本：{}", path.display()),
         )
-        .into());
+    })?;
+    if source
+        .bytes()
+        .any(|byte| byte < 0x20 && !matches!(byte, b'\t' | b'\n' | b'\r' | 0x0c))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("文件含二进制控制字符：{}", path.display()),
+        ));
     }
-    Ok(documents)
+    let markdown = source
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let kind = document_kind(path);
+    let filename = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let title = if kind == DocumentKind::Markdown {
+        document_title(&markdown).unwrap_or(filename)
+    } else {
+        filename
+    };
+    // A final newline terminates the last source line rather than inventing a new one.
+    let line_count = markdown.lines().count();
+    Ok(SourceDocument {
+        path: path.to_owned(),
+        title,
+        markdown,
+        line_count,
+        kind,
+        relative_path,
+    })
+}
+
+fn document_kind(path: &Path) -> DocumentKind {
+    if is_markdown(path) {
+        return DocumentKind::Markdown;
+    }
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let special = match name.as_ref() {
+        "Dockerfile" | "Containerfile" => Some("dockerfile"),
+        "Makefile" | "GNUmakefile" => Some("make"),
+        "CMakeLists.txt" => Some("cmake"),
+        _ => None,
+    };
+    if let Some(language) = special {
+        return DocumentKind::Code(language.to_owned());
+    }
+    let extension = path
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let language = match extension.as_str() {
+        "rs" => "rust",
+        "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        "ts" | "tsx" => "typescript",
+        "py" | "pyw" => "python",
+        "sh" | "bash" | "zsh" => "bash",
+        "json" | "jsonc" => "json",
+        "yaml" | "yml" => "yaml",
+        "html" | "htm" => "html",
+        "xml" | "svg" | "vue" | "svelte" => "xml",
+        "toml" | "ini" => "ini",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" => "cpp",
+        "cs" => "cs",
+        "rb" => "ruby",
+        "kt" | "kts" => "kotlin",
+        "css" | "scss" | "sass" | "less" | "go" | "java" | "swift" | "php" | "sql" | "lua"
+        | "r" | "scala" | "dart" | "pl" | "ex" | "exs" | "erl" | "hs" | "clj" | "lisp" | "tex"
+        | "cmake" | "diff" | "patch" | "bat" | "ps1" => &extension,
+        _ => return DocumentKind::Text,
+    };
+    DocumentKind::Code(language.to_owned())
 }
 
 fn contextual(path: &Path, action: &str, err: io::Error) -> io::Error {
@@ -294,7 +436,7 @@ fn is_markdown(path: &Path) -> bool {
 fn size_error(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("单个 Markdown 超过 2 MiB，请拆分后重试：{}", path.display()),
+        format!("单个文件超过 2 MiB，请拆分后重试：{}", path.display()),
     )
 }
 
@@ -419,53 +561,220 @@ mod tests {
     }
 
     #[test]
-    fn loading_is_sorted_recursive_and_skips_build_and_hidden_directories() {
+    fn recursive_import_keeps_tree_code_text_and_hidden_sources_but_skips_outputs() {
         let dir = TempDir::new();
-        for folder in ["nested", ".hidden", "node_modules", "target"] {
-            fs::create_dir(dir.0.join(folder)).unwrap();
-            fs::write(dir.0.join(folder).join("note.md"), "# Nested").unwrap();
+        for folder in [
+            "src/nested/empty",
+            ".github/workflows",
+            "node_modules",
+            "target",
+            ".git",
+            ".cache",
+        ] {
+            fs::create_dir_all(dir.0.join(folder)).unwrap();
         }
-        fs::write(dir.0.join("z.MARKDOWN"), "\u{feff}# Last\r\n\r\nText").unwrap();
+        for folder in ["node_modules", "target", ".git", ".cache"] {
+            fs::write(dir.0.join(folder).join("ignored.rs"), "fn ignored() {}").unwrap();
+        }
         fs::write(
-            dir.0.join("a.md"),
-            "```markdown\n# Not the title\n```\n# First\n",
+            dir.0.join("README.MARKDOWN"),
+            "\u{feff}# Project\r\n\r\nText",
         )
         .unwrap();
-        fs::write(dir.0.join("not-markdown.txt"), "# Ignore").unwrap();
-        let docs = load_documents(&dir.0).unwrap();
+        fs::write(
+            dir.0.join("src/main.rs"),
+            "fn main() {\n    println!(\"Hi\");\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.0.join("src/nested/app.ts"),
+            "const value: number = 1;\n",
+        )
+        .unwrap();
+        fs::write(dir.0.join("notes.txt"), "# literal, not Markdown\n").unwrap();
+        fs::write(dir.0.join("LICENSE"), "License terms").unwrap();
+        fs::write(dir.0.join(".env"), "EXAMPLE=true\n").unwrap();
+        fs::write(dir.0.join(".github/workflows/check.yml"), "name: check\n").unwrap();
+        let result = load_workspace(&dir.0).unwrap();
+        let names: Vec<_> = result
+            .documents
+            .iter()
+            .map(|document| document.path.file_name().unwrap().to_str().unwrap())
+            .collect();
         assert_eq!(
-            docs.iter().map(|d| d.title.as_str()).collect::<Vec<_>>(),
-            ["First", "Nested", "Last"]
+            names,
+            [
+                ".env",
+                "check.yml",
+                "LICENSE",
+                "README.MARKDOWN",
+                "notes.txt",
+                "main.rs",
+                "app.ts"
+            ]
         );
-        assert!(!docs[2].markdown.contains('\r'));
+        assert!(result.warnings.is_empty());
+        let root = PathBuf::from(dir.0.file_name().unwrap());
+        assert!(result.folders.contains(&root));
+        assert!(result.folders.contains(&root.join("src/nested/empty")));
+        assert!(result.folders.contains(&root.join(".github/workflows")));
+        assert!(
+            result
+                .documents
+                .iter()
+                .all(|document| document.relative_path.starts_with(&root))
+        );
+        let rust = result
+            .documents
+            .iter()
+            .find(|document| document.path.ends_with("main.rs"))
+            .unwrap();
+        assert_eq!(rust.kind, DocumentKind::Code("rust".into()));
+        assert_eq!(rust.relative_path, root.join("src/main.rs"));
+        assert_eq!(rust.line_count, 3);
+        let markdown = result
+            .documents
+            .iter()
+            .find(|document| document.path.ends_with("README.MARKDOWN"))
+            .unwrap();
+        assert_eq!(markdown.kind, DocumentKind::Markdown);
+        assert_eq!(markdown.title, "Project");
+        assert!(!markdown.markdown.contains('\r'));
+        let text = result
+            .documents
+            .iter()
+            .find(|document| document.path.ends_with("notes.txt"))
+            .unwrap();
+        assert_eq!(text.kind, DocumentKind::Text);
+        assert_eq!(text.title, "notes.txt");
     }
 
     #[test]
-    fn invalid_utf8_and_oversized_files_report_the_path() {
+    fn nested_gitignore_is_respected_without_requiring_a_git_repository() {
         let dir = TempDir::new();
-        let path = dir.0.join("broken.md");
-        fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
-        let error = load_documents(&dir.0).err().unwrap().to_string();
-        assert!(error.contains("UTF-8") && error.contains("broken.md"));
-        fs::File::create(&path)
+        fs::create_dir_all(dir.0.join("src/empty")).unwrap();
+        fs::create_dir_all(dir.0.join("generated")).unwrap();
+        fs::write(dir.0.join(".gitignore"), "generated/\n*.tmp\n").unwrap();
+        fs::write(dir.0.join("src/.gitignore"), "skip.ts\n!keep.tmp\n").unwrap();
+        for name in [
+            "src/a.ts",
+            "src/skip.ts",
+            "src/keep.tmp",
+            "a.tmp",
+            "generated/a.rs",
+        ] {
+            fs::write(dir.0.join(name), "content").unwrap();
+        }
+        let result = load_workspace(&dir.0).unwrap();
+        let root = PathBuf::from(dir.0.file_name().unwrap());
+        let paths: Vec<_> = result
+            .documents
+            .iter()
+            .map(|document| document.relative_path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                root.join(".gitignore"),
+                root.join("src/.gitignore"),
+                root.join("src/a.ts"),
+                root.join("src/keep.tmp")
+            ]
+        );
+        assert!(result.folders.contains(&root.join("src/empty")));
+        assert!(!result.folders.contains(&root.join("generated")));
+    }
+
+    #[test]
+    fn unsuitable_files_warn_in_a_directory_but_fail_when_explicitly_opened() {
+        let dir = TempDir::new();
+        let invalid = dir.0.join("broken.md");
+        let binary = dir.0.join("binary.bin");
+        let oversized = dir.0.join("large.txt");
+        fs::write(&invalid, [0xff, 0xfe, 0x00]).unwrap();
+        fs::write(&binary, b"valid utf8 but binary\0").unwrap();
+        fs::File::create(&oversized)
             .unwrap()
             .set_len(MAX_FILE_BYTES + 1)
             .unwrap();
-        let error = load_documents(&dir.0).err().unwrap().to_string();
-        assert!(error.contains("2 MiB") && error.contains("broken.md"));
+        fs::write(dir.0.join("valid.rs"), "fn main() {}").unwrap();
+        let result = load_workspace(&dir.0).unwrap();
+        assert_eq!(result.documents.len(), 1);
+        assert_eq!(result.warnings.len(), 3);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("UTF-8") && warning.contains("broken.md"))
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("二进制") && warning.contains("binary.bin"))
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("2 MiB") && warning.contains("large.txt"))
+        );
+        for path in [invalid, binary, oversized] {
+            let error = load_workspace(&path).err().unwrap().to_string();
+            assert!(error.contains(path.file_name().unwrap().to_str().unwrap()));
+        }
     }
 
     #[test]
-    fn an_explicit_markdown_file_can_be_opened_by_itself() {
+    fn explicit_files_and_empty_folders_are_valid_imports() {
         let dir = TempDir::new();
-        let path = dir.0.join("single.md");
-        fs::write(&path, "# One file\n").unwrap();
-        let docs = load_documents(&path).unwrap();
-        assert_eq!(docs.len(), 1);
-        assert_eq!(docs[0].title, "One file");
-        let unsupported = dir.0.join("plain.txt");
-        fs::write(&unsupported, "hello").unwrap();
-        assert!(load_documents(&unsupported).is_err());
+        let empty = load_workspace(&dir.0).unwrap();
+        assert!(empty.documents.is_empty());
+        assert_eq!(empty.folders, [PathBuf::from(dir.0.file_name().unwrap())]);
+        for (name, source, kind) in [
+            ("single.md", "# One file\n", DocumentKind::Markdown),
+            ("plain.txt", "hello", DocumentKind::Text),
+            (
+                "read.py",
+                "print('hello')",
+                DocumentKind::Code("python".into()),
+            ),
+            (
+                "Dockerfile",
+                "FROM scratch",
+                DocumentKind::Code("dockerfile".into()),
+            ),
+            ("unusual.custom", "Readable text", DocumentKind::Text),
+            ("empty.txt", "", DocumentKind::Text),
+        ] {
+            let path = dir.0.join(name);
+            fs::write(&path, source).unwrap();
+            let result = load_workspace(&path).unwrap();
+            assert_eq!(result.documents.len(), 1);
+            assert!(result.folders.is_empty());
+            assert_eq!(result.documents[0].relative_path, PathBuf::from(name));
+            assert_eq!(result.documents[0].kind, kind);
+            assert_eq!(result.documents[0].markdown, source);
+        }
+        assert!(load_workspace(&dir.0.join("missing")).is_err());
+    }
+
+    #[test]
+    fn document_limit_returns_a_deterministic_partial_import_with_a_notice() {
+        let dir = TempDir::new();
+        for index in 0..=MAX_DOCUMENTS {
+            fs::write(dir.0.join(format!("{index:04}.txt")), "small").unwrap();
+        }
+        let result = load_workspace(&dir.0).unwrap();
+        assert_eq!(result.documents.len(), MAX_DOCUMENTS);
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("2000"));
+        assert!(result.documents[0].path.ends_with("0000.txt"));
+        assert!(
+            result.documents[MAX_DOCUMENTS - 1]
+                .path
+                .ends_with("1999.txt")
+        );
     }
 
     #[cfg(unix)]
@@ -480,5 +789,7 @@ mod tests {
         let docs = load_documents(&dir.0).unwrap();
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].title, "Inside");
+        assert!(load_workspace(&dir.0.join("linked.md")).is_err());
+        assert!(load_workspace(&dir.0.join("linked-directory")).is_err());
     }
 }

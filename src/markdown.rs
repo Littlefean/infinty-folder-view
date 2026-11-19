@@ -583,6 +583,76 @@ pub struct MarkdownDocument {
 }
 
 impl MarkdownDocument {
+    fn empty(width: f32) -> Self {
+        Self {
+            height: 0.0,
+            block_count: 0,
+            width: width.max(64.0),
+            blocks: Vec::new(),
+            text: String::new(),
+            text_started: false,
+            text_boundaries: Vec::new(),
+            selectable: Vec::new(),
+        }
+    }
+
+    fn finish(mut self) -> Self {
+        self.height = self.height.max(24.0);
+        self.block_count = self.blocks.len();
+        self.text_boundaries = self
+            .text
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .collect();
+        self.text_boundaries.push(self.text.len());
+        self
+    }
+
+    /// A source file is literal text, so Markdown delimiters never affect its layout.
+    /// Keep original line endings in the selection buffer, including the final newline.
+    pub fn from_code(
+        source: &str,
+        language: &str,
+        width: f32,
+        fonts: &FontCollection,
+        highlighter: &Highlighter,
+    ) -> Self {
+        let mut document = Self::empty(width);
+        document.code(source, language, fonts, highlighter, true);
+        document.finish()
+    }
+
+    /// Plain text keeps its line breaks and whitespace without interpreting markup.
+    pub fn from_text(source: &str, width: f32, fonts: &FontCollection) -> Self {
+        let mut document = Self::empty(width);
+        for line in source
+            .split_inclusive('\n')
+            .chain((source.is_empty() || source.ends_with('\n')).then_some(""))
+        {
+            let content = line.strip_suffix('\n').unwrap_or(line);
+            let content = if line.ends_with('\n') {
+                content.strip_suffix('\r').unwrap_or(content)
+            } else {
+                content
+            };
+            let paragraph = paragraph(content, 16.0, TEXT, document.width, fonts);
+            let height = paragraph.height().max(16.0 * 1.45);
+            let text = document.append_text(content);
+            document.text.push_str(&line[content.len()..]);
+            document.push(
+                height,
+                LayoutKind::Text {
+                    paragraph,
+                    text,
+                    x: 0.0,
+                    quote: false,
+                    marker: None,
+                },
+            );
+        }
+        document.finish()
+    }
+
     pub fn new(
         source: &str,
         width: f32,
@@ -590,16 +660,7 @@ impl MarkdownDocument {
         highlighter: &Highlighter,
     ) -> Self {
         let width = width.max(64.0);
-        let mut document = Self {
-            height: 0.0,
-            block_count: 0,
-            width,
-            blocks: Vec::new(),
-            text: String::new(),
-            text_started: false,
-            text_boundaries: Vec::new(),
-            selectable: Vec::new(),
-        };
+        let mut document = Self::empty(width);
         let mut after_table = false;
         for raw in parse(source) {
             let continues_table = after_table;
@@ -657,7 +718,7 @@ impl MarkdownDocument {
                 }
                 RawBlock::Code { source, language } => {
                     document.begin_text_section("\n\n");
-                    document.code(&source, &language, fonts, highlighter)
+                    document.code(&source, &language, fonts, highlighter, false)
                 }
                 RawBlock::Rule => {
                     document.height += 6.0;
@@ -697,15 +758,7 @@ impl MarkdownDocument {
                 }
             }
         }
-        document.height = document.height.max(24.0);
-        document.block_count = document.blocks.len();
-        document.text_boundaries = document
-            .text
-            .grapheme_indices(true)
-            .map(|(index, _)| index)
-            .collect();
-        document.text_boundaries.push(document.text.len());
-        document
+        document.finish()
     }
 
     fn begin_text_section(&mut self, separator: &str) {
@@ -746,6 +799,7 @@ impl MarkdownDocument {
         language: &str,
         fonts: &FontCollection,
         highlighter: &Highlighter,
+        preserve_source: bool,
     ) {
         let token = match language.to_ascii_lowercase().as_str() {
             "typescript" | "ts" | "tsx" => "js",
@@ -779,11 +833,19 @@ impl MarkdownDocument {
                 label: true,
             },
         );
-        for (index, line) in LinesWithEndings::from(source).enumerate() {
-            if index > 0 {
+        let final_line = preserve_source && (source.is_empty() || source.ends_with('\n'));
+        for (index, line) in LinesWithEndings::from(source)
+            .chain(final_line.then_some(""))
+            .enumerate()
+        {
+            if index > 0 && !preserve_source {
                 self.text.push('\n');
             }
-            let text = self.append_text(line.trim_end_matches(['\r', '\n']));
+            let content = line.trim_end_matches(['\r', '\n']);
+            let text = self.append_text(content);
+            if preserve_source {
+                self.text.push_str(&line[content.len()..]);
+            }
             let mut style = ParagraphStyle::new();
             style.set_text_style(&text_style(14.0, TEXT, true));
             let mut builder = ParagraphBuilder::new(&style, fonts.clone());
@@ -1389,6 +1451,74 @@ mod tests {
             .unwrap();
         assert_eq!(document.hit_test(16.0, code_block.y + 5.0, false), None);
         assert!(document.hit_test(55.0, code_block.y + 5.0, false).is_some());
+    }
+
+    #[test]
+    fn source_code_is_literal_and_copies_original_line_endings() {
+        let source = "# literal heading\r\nconst text = `**中👩‍💻 e\u{301}**`;\r\n\r\n\t```\r\n";
+        let document = MarkdownDocument::from_code(
+            source,
+            "typescript",
+            320.0,
+            &font_collection(),
+            &Highlighter::new(),
+        );
+        assert_eq!(document.selected_text(0..document.text_len()), source);
+        assert!(
+            document
+                .blocks
+                .iter()
+                .all(|block| matches!(block.kind, LayoutKind::Code { .. }))
+        );
+        let lines = document
+            .blocks
+            .iter()
+            .filter(|block| matches!(block.kind, LayoutKind::Code { text: Some(_), .. }))
+            .count();
+        assert_eq!(lines, 5);
+        let second = source.find("const").unwrap();
+        assert_eq!(
+            document.selected_text(document.paragraph_range(second)),
+            "const text = `**中👩‍💻 e\u{301}**`;"
+        );
+        let first = document
+            .blocks
+            .iter()
+            .find(|block| matches!(block.kind, LayoutKind::Code { text: Some(_), .. }))
+            .unwrap();
+        assert_eq!(document.hit_test(50.0, first.y + 5.0, false), Some(0));
+    }
+
+    #[test]
+    fn literal_text_keeps_markup_blank_lines_and_terminal_newline() {
+        let source = "# **原样** [link](url)\r\n\r\n  中👩‍💻 e\u{301}\n";
+        let document = MarkdownDocument::from_text(source, 240.0, &font_collection());
+        assert_eq!(document.selected_text(0..document.text_len()), source);
+        assert_eq!(document.block_count, 4);
+        assert!(
+            document
+                .blocks
+                .iter()
+                .all(|block| matches!(block.kind, LayoutKind::Text { .. }))
+        );
+        assert_eq!(
+            document.selected_text(document.paragraph_range(0)),
+            "# **原样** [link](url)"
+        );
+    }
+
+    #[test]
+    fn empty_and_unterminated_source_files_have_a_readable_line() {
+        let fonts = font_collection();
+        let highlighter = Highlighter::new();
+        for source in ["", "  hello\t中", "\n", "\n\n"] {
+            let code = MarkdownDocument::from_code(source, "unknown", 300.0, &fonts, &highlighter);
+            let text = MarkdownDocument::from_text(source, 300.0, &fonts);
+            assert_eq!(code.selected_text(0..code.text_len()), source);
+            assert_eq!(text.selected_text(0..text.text_len()), source);
+            assert!(code.height > 0.0 && text.height > 0.0);
+            assert!(!code.selectable.is_empty() && !text.selectable.is_empty());
+        }
     }
 
     #[test]

@@ -1,5 +1,7 @@
-pub const MIN_SCALE: f64 = 0.015;
-pub const MAX_SCALE: f64 = 4.0;
+// Keep the camera effectively unbounded for large workspaces while retaining
+// practical numerical limits for screen/world coordinate conversions.
+pub const MIN_SCALE: f64 = 0.0001;
+pub const MAX_SCALE: f64 = 64.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
@@ -307,6 +309,24 @@ mod tests {
             near(after.1, before.1);
             assert!((MIN_SCALE..=MAX_SCALE).contains(&camera.scale));
         }
+    }
+
+    #[test]
+    fn zoom_and_fit_reach_the_extended_range() {
+        let mut camera = Camera::default();
+        camera.zoom_at(600.0, 400.0, 1.0e20);
+        near(camera.scale, MAX_SCALE);
+        camera.zoom_at(600.0, 400.0, 1.0e-20);
+        near(camera.scale, MIN_SCALE);
+
+        camera.fit(
+            Rect::new(0.0, 0.0, 5_000_000.0, 5_000_000.0),
+            1200.0,
+            800.0,
+            80.0,
+        );
+        assert!(camera.scale > MIN_SCALE);
+        assert!(camera.scale < 0.015);
     }
 
     #[test]

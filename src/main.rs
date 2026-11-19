@@ -2,7 +2,10 @@ mod animation_check;
 mod camera;
 mod clipboard;
 mod documents;
+mod file_picker;
+mod layout;
 mod markdown;
+mod presentation;
 mod renderer;
 mod scene;
 
@@ -10,8 +13,13 @@ use animation_check::AnimationCheck;
 use camera::{Camera, CameraMotion};
 use objc2::rc::autoreleasepool;
 use renderer::Renderer;
-use scene::{Scene, TOP_BAR};
-use std::{error::Error, path::PathBuf, time::Instant};
+use scene::{Scene, TOP_BAR, ToolbarAction};
+use std::{
+    error::Error,
+    path::PathBuf,
+    sync::mpsc::{self, Receiver},
+    time::{Duration, Instant},
+};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent},
@@ -69,7 +77,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "Markdown Atlas — native Rust + Skia/SkParagraph + Metal\n\n  cargo run --release\n  cargo run --release -- --dir /path/to/markdown\n  cargo run --release -- --demo-count 200\n  cargo run --release -- --smoke-test work/smoke\n  cargo run --release -- --animation-test work/animation\n\nControls: left drag to select text; double-click word / triple-click paragraph; Shift+click to extend; Cmd+A select active document; Cmd+C copy; middle drag / Space+left drag to pan; wheel to smoothly zoom at cursor; F fit all; 1 actual size; R reset; L toggle overview detail. Click minimap to navigate. Drop a Markdown file or folder to load it.\n\nDefault: generate 72 real Markdown files in demo-markdown/ without overwriting existing files. macOS / Metal required."
+                        "Markdown Atlas — native Rust + Skia/SkParagraph + Metal\n\n  cargo run --release\n  cargo run --release -- --dir /path/to/markdown\n  cargo run --release -- --demo-count 200\n  cargo run --release -- --smoke-test work/smoke\n  cargo run --release -- --animation-test work/animation\n\nControls: drag blank canvas/folder space to marquee-select; Shift+click toggles nodes; click covers to reveal files/folders, double-click files to focus or folders to reveal recursively; left drag on body to select text; double-click word / triple-click paragraph; Shift+click to extend; Cmd+A select active document; Cmd+C copy; middle drag / Space+left drag to pan; wheel to smoothly zoom at cursor; F fit all; 1 actual size; R reset; L toggle overview detail. Click minimap to navigate. Cmd+O import folder or text/code file; drag node headers to move with collision; A arrange selected folder or whole tree. Drop a file or folder to load it.\n\nDefault: generate 72 real Markdown files in demo-markdown/ without overwriting existing files. macOS / Metal required."
                     );
                     return Ok(None);
                 }
@@ -109,6 +117,8 @@ struct App {
     selection_pan_time: Option<Instant>,
     selection_drag_origin: Option<(f64, f64)>,
     selection_drag_moved: bool,
+    importing: Option<Receiver<Result<documents::ImportResult, String>>>,
+    fit_after_import: bool,
 }
 
 impl App {
@@ -116,10 +126,26 @@ impl App {
         if let Some(renderer) = &self.renderer {
             let (width, height) = renderer.logical_size();
             renderer.window.set_cursor(
-                if self.middle_down || (self.space_down && self.left_down) {
+                if self.middle_down
+                    || (self.space_down && self.left_down)
+                    || self.scene.is_dragging_node()
+                {
                     CursorIcon::Grabbing
                 } else if self.space_down {
                     CursorIcon::Grab
+                } else if self
+                    .scene
+                    .toolbar_action(self.cursor.0, self.cursor.1, width)
+                    .is_some()
+                {
+                    CursorIcon::Pointer
+                } else if self
+                    .scene
+                    .draggable_at(self.cursor.0, self.cursor.1, width, height)
+                {
+                    CursorIcon::Grab
+                } else if self.scene.is_marquee_selecting() {
+                    CursorIcon::Crosshair
                 } else if self.scene.is_selecting()
                     || self
                         .scene
@@ -134,12 +160,70 @@ impl App {
     }
 
     fn wait_for_event(&self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(
-            self.animation_check
-                .as_ref()
-                .and_then(AnimationCheck::deadline)
-                .map_or(ControlFlow::Wait, ControlFlow::WaitUntil),
-        );
+        let deadline = self
+            .animation_check
+            .as_ref()
+            .and_then(AnimationCheck::deadline);
+        let deadline = if self.importing.is_some() {
+            let poll = Instant::now() + Duration::from_millis(30);
+            Some(deadline.map_or(poll, |deadline| deadline.min(poll)))
+        } else {
+            deadline
+        };
+        event_loop.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    }
+
+    fn start_import(&mut self, path: PathBuf) {
+        self.scene.finish_node_drag();
+        self.scene.finish_selection();
+        self.middle_down = false;
+        self.left_down = false;
+        self.space_down = false;
+        self.selection_pan_time = None;
+        self.last_click = None;
+        self.motion.cancel(self.scene.camera);
+        self.scene.message = format!("正在读取 {}…", path.display());
+        let (sender, receiver) = mpsc::channel();
+        self.importing = Some(receiver);
+        std::thread::spawn(move || {
+            let result = documents::load_workspace(&path).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+    }
+
+    fn poll_import(&mut self) {
+        let result = match self.importing.as_ref().map(|receiver| receiver.try_recv()) {
+            Some(Ok(result)) => result,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => Err("导入线程意外结束".into()),
+            _ => return,
+        };
+        self.importing = None;
+        match result {
+            Ok(import) => {
+                for warning in &import.warnings {
+                    eprintln!("{warning}");
+                }
+                self.scene = Scene::from_import(import);
+                self.motion.cancel(self.scene.camera);
+                self.animation_time = None;
+                self.fit_after_import = true;
+            }
+            Err(error) => self.scene.message = format!("导入失败：{error}"),
+        }
+    }
+
+    fn open_import(&mut self) {
+        self.scene.finish_node_drag();
+        self.scene.finish_selection();
+        self.motion.cancel(self.scene.camera);
+        self.left_down = false;
+        self.middle_down = false;
+        self.space_down = false;
+        self.last_click = None;
+        self.selection_pan_time = None;
+        if let Some(path) = file_picker::choose_path() {
+            self.start_import(path);
+        }
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: impl std::fmt::Display) {
@@ -150,12 +234,15 @@ impl App {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_import();
         let Some(renderer) = &mut self.renderer else {
             return;
         };
         if self.occluded {
             self.animation_time = None;
             self.selection_pan_time = None;
+            // Import completion can remove the last polling deadline while hidden.
+            self.wait_for_event(event_loop);
             return;
         }
         // Layout happens once per file. Limiting it to one file per redraw keeps startup interactive.
@@ -164,6 +251,13 @@ impl App {
         }
         let ready = self.scene.ready();
         let (width, height) = renderer.logical_size();
+        if ready && self.fit_after_import {
+            self.scene
+                .camera
+                .fit(self.scene.bounds, width, height - 38.0, TOP_BAR);
+            self.motion.cancel(self.scene.camera);
+            self.fit_after_import = false;
+        }
         if ready
             && let Some(check) = &mut self.animation_check
             && !check.started()
@@ -356,7 +450,9 @@ impl ApplicationHandler for App {
             }
             return;
         }
-        if self.retry_draw && matches!(cause, StartCause::ResumeTimeReached { .. }) {
+        if (self.retry_draw || self.importing.is_some())
+            && matches!(cause, StartCause::ResumeTimeReached { .. })
+        {
             self.retry_draw = false;
             self.wait_for_event(event_loop);
             if let Some(renderer) = &self.renderer {
@@ -400,6 +496,7 @@ impl ApplicationHandler for App {
                 self.left_down = false;
                 self.space_down = false;
                 self.scene.finish_selection();
+                self.scene.finish_node_drag();
                 self.selection_pan_time = None;
                 self.selection_drag_origin = None;
                 self.selection_drag_moved = false;
@@ -413,6 +510,12 @@ impl ApplicationHandler for App {
                         .pan(p.x - self.cursor.0, p.y - self.cursor.1);
                     self.motion.cancel(self.scene.camera);
                     self.animation_time = None;
+                } else if self.left_down && self.scene.is_dragging_node() {
+                    self.scene.update_node_drag(p.x, p.y);
+                    self.last_click = None;
+                } else if self.left_down && self.scene.is_marquee_selecting() {
+                    self.scene.update_marquee(p.x, p.y, width, height);
+                    self.last_click = None;
                 } else if self.left_down && self.scene.is_selecting() {
                     if self
                         .selection_drag_origin
@@ -427,6 +530,8 @@ impl ApplicationHandler for App {
                 if !self.middle_down
                     && !(self.space_down && self.left_down)
                     && !self.scene.is_selecting()
+                    && !self.scene.is_dragging_node()
+                    && !self.scene.is_marquee_selecting()
                 {
                     self.update_cursor();
                     return;
@@ -440,6 +545,7 @@ impl ApplicationHandler for App {
                         if pressed {
                             self.motion.cancel(self.scene.camera);
                             self.scene.finish_selection();
+                            self.scene.finish_node_drag();
                             self.last_click = None;
                         }
                     }
@@ -450,9 +556,40 @@ impl ApplicationHandler for App {
                         if pressed && self.space_down {
                             self.motion.cancel(self.scene.camera);
                             self.scene.finish_selection();
+                            self.scene.finish_node_drag();
                             self.last_click = None;
                         }
                         if pressed && !self.space_down && !self.middle_down {
+                            if let Some(action) =
+                                self.scene
+                                    .toolbar_action(self.cursor.0, self.cursor.1, width)
+                            {
+                                self.scene.finish_node_drag();
+                                self.scene.finish_selection();
+                                self.last_click = None;
+                                match action {
+                                    ToolbarAction::Import => self.open_import(),
+                                    ToolbarAction::Arrange => {
+                                        self.scene.arrange();
+                                    }
+                                    ToolbarAction::Fit => {
+                                        let mut camera = self.scene.camera;
+                                        camera.fit(
+                                            self.scene.bounds,
+                                            width,
+                                            height - 38.0,
+                                            TOP_BAR,
+                                        );
+                                        self.motion.move_to(camera);
+                                        self.animation_time = Some(Instant::now());
+                                    }
+                                }
+                                if let Some(renderer) = &self.renderer {
+                                    renderer.window.request_redraw();
+                                }
+                                self.wait_for_event(event_loop);
+                                return;
+                            }
                             let before = self.scene.camera;
                             let minimap = self.scene.navigate_minimap(
                                 self.cursor.0,
@@ -463,8 +600,18 @@ impl ApplicationHandler for App {
                             let destination = self.scene.camera;
                             self.scene.camera = before;
                             if minimap {
+                                self.scene.finish_node_drag();
                                 self.scene.finish_selection();
                                 self.motion.move_to(destination);
+                                self.last_click = None;
+                            } else if self.scene.begin_node_pointer(
+                                self.cursor.0,
+                                self.cursor.1,
+                                width,
+                                height,
+                                self.modifiers.shift_key(),
+                            ) {
+                                self.motion.cancel(self.scene.camera);
                                 self.last_click = None;
                             } else {
                                 self.motion.cancel(self.scene.camera);
@@ -493,6 +640,9 @@ impl ApplicationHandler for App {
                             }
                         }
                         if !pressed {
+                            if let Some(destination) = self.scene.end_node_pointer(width, height) {
+                                self.motion.move_to(destination);
+                            }
                             self.scene.finish_selection();
                             self.selection_pan_time = None;
                         }
@@ -508,7 +658,11 @@ impl ApplicationHandler for App {
                 if !amount.is_finite() || amount == 0.0 {
                     return;
                 }
+                if self.scene.is_dragging_node() || self.scene.is_marquee_selecting() {
+                    return;
+                }
                 self.scene.finish_selection();
+                self.scene.finish_node_drag();
                 self.last_click = None;
                 self.motion.zoom_at(
                     &self.scene.camera,
@@ -523,11 +677,12 @@ impl ApplicationHandler for App {
                     self.space_down = pressed;
                     if pressed {
                         self.scene.finish_selection();
+                        self.scene.finish_node_drag();
                     }
                 }
                 if pressed && !event.repeat {
                     let navigation_key = match &event.logical_key {
-                        Key::Character(key) => ["f", "1", "r", "l"]
+                        Key::Character(key) => ["f", "1", "r", "l", "a"]
                             .iter()
                             .any(|name| key.eq_ignore_ascii_case(name)),
                         Key::Named(
@@ -539,11 +694,22 @@ impl ApplicationHandler for App {
                         _ => false,
                     };
                     if navigation_key {
+                        self.scene.finish_node_drag();
                         self.scene.finish_selection();
                         self.selection_pan_time = None;
                         self.last_click = None;
                     }
                     match &event.logical_key {
+                        Key::Character(key)
+                            if key.eq_ignore_ascii_case("o") && self.modifiers.super_key() =>
+                        {
+                            self.open_import();
+                        }
+                        Key::Character(key)
+                            if key.eq_ignore_ascii_case("a") && !self.modifiers.super_key() =>
+                        {
+                            self.scene.arrange();
+                        }
                         Key::Character(key)
                             if key.eq_ignore_ascii_case("c") && self.modifiers.super_key() =>
                         {
@@ -593,6 +759,7 @@ impl ApplicationHandler for App {
                             self.space_down = false;
                             self.motion.cancel(self.scene.camera);
                             self.scene.clear_selection();
+                            self.scene.finish_node_drag();
                             self.last_click = None;
                             self.selection_pan_time = None;
                             self.scene.message.clear();
@@ -613,20 +780,7 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::DroppedFile(path) => match documents::load_documents(&path) {
-                Ok(documents) if !documents.is_empty() => {
-                    self.scene = Scene::new(documents);
-                    self.motion.cancel(self.scene.camera);
-                    self.animation_time = None;
-                    self.last_click = None;
-                    self.selection_pan_time = None;
-                }
-                Ok(_) => self.scene.message = "没有找到 Markdown 文件。按 R 返回。".into(),
-                Err(error) => {
-                    eprintln!("{error}");
-                    self.scene.message = format!("读取失败：{error}");
-                }
-            },
+            WindowEvent::DroppedFile(path) => self.start_import(path),
             _ => return,
         }
         if self.motion.is_active() {
@@ -634,7 +788,10 @@ impl ApplicationHandler for App {
         } else {
             self.animation_time = None;
         }
-        renderer.window.request_redraw();
+        if let Some(renderer) = &self.renderer {
+            renderer.window.request_redraw();
+        }
+        self.wait_for_event(event_loop);
         self.update_cursor();
     }
 }
@@ -665,15 +822,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     if options.demo {
         documents::ensure_demo_documents(&options.directory, options.count)?;
     }
-    let documents = documents::load_documents(&options.directory)?;
-    if documents.is_empty() {
-        return Err(format!("No Markdown files found in {}", options.directory.display()).into());
-    }
+    let import = documents::load_workspace(&options.directory)?;
     println!(
-        "Loading {} Markdown files from {}",
-        documents.len(),
+        "Loading {} files and {} folders from {}",
+        import.documents.len(),
+        import.folders.len(),
         options.directory.display()
     );
+    for warning in &import.warnings {
+        eprintln!("{warning}");
+    }
     let smoke = options.smoke.map(|directory| Smoke {
         directory,
         frame: 0,
@@ -683,7 +841,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
     let mut app = App {
         renderer: None,
-        scene: Scene::new(documents),
+        scene: Scene::from_import(import),
         cursor: (720.0, 450.0),
         middle_down: false,
         left_down: false,
@@ -700,6 +858,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         selection_pan_time: None,
         selection_drag_origin: None,
         selection_drag_moved: false,
+        importing: None,
+        fit_after_import: false,
     };
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
